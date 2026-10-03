@@ -3,6 +3,7 @@ import re
 import asyncio
 import requests
 from telebot.async_telebot import AsyncTeleBot
+import yt_dlp
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 bot = AsyncTeleBot(BOT_TOKEN)
@@ -22,40 +23,28 @@ async def handle_messages(message):
             
         await bot.send_chat_action(message.chat.id, 'upload_video')
         
-        # 1. DIRECT DEDICATED PIPELINE FOR YOUTUBE VIDEOS & SHORTS
+        # 1. LOCAL DEDICATED EXTRACTOR FOR YOUTUBE VIDEOS & SHORTS
         if 'youtube.com' in url or 'youtu.be' in url or 'shorts/' in url:
             try:
-                # Direct streaming video fetch engine skips proxy server bottlenecks
-                payload = {
-                    "url": raw_url,
-                    "videoQuality": "480", # Optimized resolution bypasses Telegram file size limits
-                    "filenamePattern": "basic",
-                    "downloadMode": "auto"
+                # Configure native engine to extract lightweight mp4 variants safely
+                ydl_opts = {
+                    'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+                    'outtmpl': 'downloaded_media.mp4',
+                    'quiet': True,
+                    'no_warnings': True,
+                    # Simulates normal mobile traffic to bypass network captcha walls
+                    'extractor_args': {'youtube': {'player_client': ['ios', 'android']}}
                 }
-                headers = {"Accept": "application/json", "Content-Type": "application/json"}
                 
-                # Attempt direct bypass using alternative processing relays
-                for yt_node in ["https://wuk.sh", "https://unbanned.co", "https://cobalt.tools"]:
-                    try:
-                        res = requests.post(yt_node, json=payload, headers=headers, timeout=8)
-                        if res.status_code == 200:
-                            data = res.json()
-                            if data.get("status") in ["stream", "picker"]:
-                                video_url = data.get("url")
-                                with requests.get(video_url, stream=True, timeout=15) as video_stream:
-                                    video_stream.raise_for_status()
-                                    with open('downloaded_media.mp4', 'wb') as f:
-                                        for chunk in video_stream.iter_content(chunk_size=8192):
-                                            f.write(chunk)
-                                
-                                with open('downloaded_media.mp4', 'rb') as video:
-                                    await bot.send_video(message.chat.id, video, reply_to_message_id=message.message_id)
-                                os.remove('downloaded_media.mp4')
-                                return
-                    except Exception:
-                        continue
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([raw_url])
+                
+                with open('downloaded_media.mp4', 'rb') as video:
+                    await bot.send_video(message.chat.id, video, reply_to_message_id=message.message_id)
+                os.remove('downloaded_media.mp4')
+                return
             except Exception as e:
-                print(f"Direct YouTube download attempt bypassed: {e}")
+                print(f"Local YouTube engine bypass failed: {e}")
 
         # 2. DIRECT PIPELINE FOR TIKTOK
         if 'tiktok.com' in url or 'vm.tiktok' in url or 'vt.tiktok' in url:
@@ -81,7 +70,7 @@ async def handle_messages(message):
         # 3. DIRECT PIPELINE FOR INSTAGRAM
         if 'instagram.com' in url and any(x in url for x in ['/reel/', '/p/', '/tv/']):
             try:
-                clean_url = raw_url.split('?')[0]
+                clean_url = raw_url.split('?')
                 if not clean_url.endswith('/'):
                     clean_url += '/'
                 embed_url = f"{clean_url}embed/captioned/"
