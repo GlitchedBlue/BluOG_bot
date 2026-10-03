@@ -3,7 +3,6 @@ import re
 import asyncio
 import requests
 from telebot.async_telebot import AsyncTeleBot
-import yt_dlp
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 bot = AsyncTeleBot(BOT_TOKEN)
@@ -23,28 +22,53 @@ async def handle_messages(message):
             
         await bot.send_chat_action(message.chat.id, 'upload_video')
         
-        # 1. LOCAL DEDICATED EXTRACTOR FOR YOUTUBE VIDEOS & SHORTS
+        # 1. NATIVE INVIDIOUS ENGINE FOR YOUTUBE VIDEOS & SHORTS (Bypasses IP Blocks)
         if 'youtube.com' in url or 'youtu.be' in url or 'shorts/' in url:
             try:
-                # Configure native engine to extract lightweight mp4 variants safely
-                ydl_opts = {
-                    'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-                    'outtmpl': 'downloaded_media.mp4',
-                    'quiet': True,
-                    'no_warnings': True,
-                    # Simulates normal mobile traffic to bypass network captcha walls
-                    'extractor_args': {'youtube': {'player_client': ['ios', 'android']}}
-                }
-                
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([raw_url])
-                
-                with open('downloaded_media.mp4', 'rb') as video:
-                    await bot.send_video(message.chat.id, video, reply_to_message_id=message.message_id)
-                os.remove('downloaded_media.mp4')
-                return
-            except Exception as e:
-                print(f"Local YouTube engine bypass failed: {e}")
+                # Extract the alphanumeric YouTube Video ID string cleanly
+                video_id = None
+                if 'shorts/' in url:
+                    video_id = raw_url.split('shorts/')[-1].split('?')[0].split('/')[0]
+                elif 'youtu.be' in url:
+                    video_id = raw_url.split('/')[-1].split('?')[0]
+                elif 'v=' in url:
+                    video_id = raw_url.split('v=')[-1].split('&')[0]
+
+                if video_id:
+                    # A rotating pool of major open-source Invidious instances
+                    invidious_instances = [
+                        "https://vps.re",
+                        "https://yewtu.be",
+                        "https://nerdvpn.de",
+                        "https://tux.digital"
+                    ]
+                    
+                    for instance in invidious_instances:
+                        try:
+                            # Request the clean streaming source profiles metadata block
+                            api_url = f"{instance}/api/v1/videos/{video_id}"
+                            res = requests.get(api_url, timeout=6).json()
+                            
+                            # Filter for the highest available integrated video/audio format profile
+                            formats = res.get("formatStreams", [])
+                            if formats:
+                                direct_video_url = formats[-1].get("url") or formats[0].get("url")
+                                
+                                # Download the clean stream asset from the privacy node relay
+                                with requests.get(direct_video_url, stream=True, timeout=15) as stream:
+                                    stream.raise_for_status()
+                                    with open('downloaded_media.mp4', 'wb') as f:
+                                        for chunk in stream.iter_content(chunk_size=8192):
+                                            f.write(chunk)
+                                            
+                                with open('downloaded_media.mp4', 'rb') as video:
+                                    await bot.send_video(message.chat.id, video, reply_to_message_id=message.message_id)
+                                os.remove('downloaded_media.mp4')
+                                return
+                        except Exception:
+                            continue # Fallback to the next mirror instance if this one is rate-limited
+            except Exception as yt_err:
+                print(f"Invidious retrieval failure: {yt_err}")
 
         # 2. DIRECT PIPELINE FOR TIKTOK
         if 'tiktok.com' in url or 'vm.tiktok' in url or 'vt.tiktok' in url:
@@ -52,8 +76,8 @@ async def handle_messages(message):
                 resolved_url = requests.head(raw_url, allow_redirects=True, timeout=8).url
                 video_id_match = re.search(r'/video/(\d+)', resolved_url)
                 if video_id_match:
-                    video_id = video_id_match.group(1)
-                    direct_api = f"https://tiktokv.com{video_id}"
+                    video_id_tk = video_id_match.group(1)
+                    direct_api = f"https://tiktokv.com{video_id_tk}"
                     res = requests.get(direct_api, timeout=10).json()
                     play_addr = res['aweme_list']['video']['play_addr']['url_list']
                     video_data = requests.get(play_addr, headers={'User-Agent': 'Mozilla/5.0'}, timeout=15).content
