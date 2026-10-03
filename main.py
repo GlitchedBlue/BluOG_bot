@@ -9,6 +9,18 @@ bot = AsyncTeleBot(BOT_TOKEN)
 
 UNIVERSAL_URL_REGEX = r'(https?://[^\s]+)'
 
+# Helper function accurately pulls the unique video ID string out of ANY YouTube URL format
+def extract_youtube_id(url):
+    patterns = [
+        r'(?:v=|\/shorts\/|\/embed\/|\/v\/|youtu\.be\/|\/vi\/)([a-zA-Z0-9_-]{11})',
+        r'youtube\.com\/watch\?.*v=([a-zA-Z0-9_-]{11})'
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url, re.IGNORECASE)
+        if match:
+            return match.group(1)
+    return None
+
 @bot.message_handler(func=lambda message: True)
 async def handle_messages(message):
     match = re.search(UNIVERSAL_URL_REGEX, message.text or "")
@@ -22,40 +34,32 @@ async def handle_messages(message):
             
         await bot.send_chat_action(message.chat.id, 'upload_video')
         
-        # 1. NATIVE INVIDIOUS ENGINE FOR YOUTUBE VIDEOS & SHORTS (Bypasses IP Blocks)
+        # 1. NATIVE COMPRESSED INVIDIOUS ENGINE FOR ALL YOUTUBE VIDEOS & SHORTS
         if 'youtube.com' in url or 'youtu.be' in url or 'shorts/' in url:
             try:
-                # Extract the alphanumeric YouTube Video ID string cleanly
-                video_id = None
-                if 'shorts/' in url:
-                    video_id = raw_url.split('shorts/')[-1].split('?')[0].split('/')[0]
-                elif 'youtu.be' in url:
-                    video_id = raw_url.split('/')[-1].split('?')[0]
-                elif 'v=' in url:
-                    video_id = raw_url.split('v=')[-1].split('&')[0]
+                video_id = extract_youtube_id(raw_url)
 
                 if video_id:
-                    # A rotating pool of major open-source Invidious instances
+                    # Public Invidious mirror infrastructure nodes
                     invidious_instances = [
-                        "https://vps.re",
                         "https://yewtu.be",
+                        "https://vps.re",
                         "https://nerdvpn.de",
                         "https://tux.digital"
                     ]
                     
                     for instance in invidious_instances:
                         try:
-                            # Request the clean streaming source profiles metadata block
                             api_url = f"{instance}/api/v1/videos/{video_id}"
                             res = requests.get(api_url, timeout=6).json()
                             
-                            # Filter for the highest available integrated video/audio format profile
+                            # Checks web optimization formats first to keep files below Telegram's 50MB bot cap
                             formats = res.get("formatStreams", [])
                             if formats:
-                                direct_video_url = formats[-1].get("url") or formats[0].get("url")
+                                # Picks a web-optimized profile (like 360p or 480p) to safely stream long-form videos
+                                direct_video_url = formats[0].get("url") or formats[-1].get("url")
                                 
-                                # Download the clean stream asset from the privacy node relay
-                                with requests.get(direct_video_url, stream=True, timeout=15) as stream:
+                                with requests.get(direct_video_url, stream=True, timeout=20) as stream:
                                     stream.raise_for_status()
                                     with open('downloaded_media.mp4', 'wb') as f:
                                         for chunk in stream.iter_content(chunk_size=8192):
@@ -66,9 +70,9 @@ async def handle_messages(message):
                                 os.remove('downloaded_media.mp4')
                                 return
                         except Exception:
-                            continue # Fallback to the next mirror instance if this one is rate-limited
+                            continue 
             except Exception as yt_err:
-                print(f"Invidious retrieval failure: {yt_err}")
+                print(f"YouTube processing pipeline issue: {yt_err}")
 
         # 2. DIRECT PIPELINE FOR TIKTOK
         if 'tiktok.com' in url or 'vm.tiktok' in url or 'vt.tiktok' in url:
@@ -125,3 +129,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
