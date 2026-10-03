@@ -1,5 +1,4 @@
 import os
-import re
 import asyncio
 import requests
 from telebot.async_telebot import AsyncTeleBot
@@ -7,126 +6,88 @@ from telebot.async_telebot import AsyncTeleBot
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 bot = AsyncTeleBot(BOT_TOKEN)
 
-UNIVERSAL_URL_REGEX = r'(https?://[^\s]+)'
-
-# Helper function accurately pulls the unique video ID string out of ANY YouTube URL format
-def extract_youtube_id(url):
-    patterns = [
-        r'(?:v=|\/shorts\/|\/embed\/|\/v\/|youtu\.be\/|\/vi\/)([a-zA-Z0-9_-]{11})',
-        r'youtube\.com\/watch\?.*v=([a-zA-Z0-9_-]{11})'
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, url, re.IGNORECASE)
-        if match:
-            return match.group(1)
-    return None
-
 @bot.message_handler(func=lambda message: True)
 async def handle_messages(message):
-    match = re.search(UNIVERSAL_URL_REGEX, message.text or "")
-    if match:
-        raw_url = match.group(1)
-        url = raw_url.lower()
-        
-        valid_platforms = ['instagram.com', 'facebook.com', 'fb.watch', 'tiktok.com', 'youtube.com', 'shorts/', 'youtu.be']
-        if not any(platform in url for platform in valid_platforms):
-            return  
+    # Hardcoded test: triggers on ANY message sent to the chat
+    await bot.send_chat_action(message.chat.id, 'upload_video')
+    
+    # Target video ID directly bypassing regex splits
+    TARGET_VIDEO_ID = "gi5tv_4p0z0"
+    
+    # Try different public extraction relays sequentially
+    processing_nodes = [
+        "https://wuk.sh",
+        "https://unbanned.co",
+        "https://cobalt.tools"
+    ]
+    
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    payload = {
+        "url": f"https://youtube.com{TARGET_VIDEO_ID}",
+        "videoQuality": "480", # Forces a lightweight file to clear Telegram size caps
+        "filenamePattern": "basic",
+        "downloadMode": "auto"
+    }
+    
+    video_stream_payload = None
+    successful_node = None
+    
+    for node in processing_nodes:
+        try:
+            print(f"Testing connection hook with: {node}")
+            response = requests.post(node, json=payload, headers=headers, timeout=8)
+            print(f"Node response status code: {response.status_code}")
             
-        await bot.send_chat_action(message.chat.id, 'upload_video')
+            if response.status_code == 200:
+                node_data = response.json()
+                print(f"Node API payload response data: {node_data}")
+                
+                if node_data.get("status") in ["stream", "picker"]:
+                    video_url = node_data.get("url")
+                    video_stream_payload = requests.get(video_url, stream=True, timeout=15)
+                    successful_node = node
+                    break
+        except Exception as node_err:
+            print(f"Node entry {node} failed: {node_err}")
+            continue
+            
+    if not video_stream_payload:
+        print("CRITICAL: All test extraction relays returned blocks or rate-limits.")
+        await bot.reply_to(message, "Test failed: All cloud processing nodes are currently overloaded.")
+        return
+
+    print(f"Success! Pulling data block from streaming mirror found on: {successful_node}")
+
+    try:
+        with open('test_media.mp4', 'wb') as f:
+            for chunk in video_stream_payload.iter_content(chunk_size=8192):
+                f.write(chunk)
         
-        # 1. NATIVE COMPRESSED INVIDIOUS ENGINE FOR ALL YOUTUBE VIDEOS & SHORTS
-        if 'youtube.com' in url or 'youtu.be' in url or 'shorts/' in url:
-            try:
-                video_id = extract_youtube_id(raw_url)
-
-                if video_id:
-                    # Public Invidious mirror infrastructure nodes
-                    invidious_instances = [
-                        "https://yewtu.be",
-                        "https://vps.re",
-                        "https://nerdvpn.de",
-                        "https://tux.digital"
-                    ]
-                    
-                    for instance in invidious_instances:
-                        try:
-                            api_url = f"{instance}/api/v1/videos/{video_id}"
-                            res = requests.get(api_url, timeout=6).json()
-                            
-                            # Checks web optimization formats first to keep files below Telegram's 50MB bot cap
-                            formats = res.get("formatStreams", [])
-                            if formats:
-                                # Picks a web-optimized profile (like 360p or 480p) to safely stream long-form videos
-                                direct_video_url = formats[0].get("url") or formats[-1].get("url")
-                                
-                                with requests.get(direct_video_url, stream=True, timeout=20) as stream:
-                                    stream.raise_for_status()
-                                    with open('downloaded_media.mp4', 'wb') as f:
-                                        for chunk in stream.iter_content(chunk_size=8192):
-                                            f.write(chunk)
-                                            
-                                with open('downloaded_media.mp4', 'rb') as video:
-                                    await bot.send_video(message.chat.id, video, reply_to_message_id=message.message_id)
-                                os.remove('downloaded_media.mp4')
-                                return
-                        except Exception:
-                            continue 
-            except Exception as yt_err:
-                print(f"YouTube processing pipeline issue: {yt_err}")
-
-        # 2. DIRECT PIPELINE FOR TIKTOK
-        if 'tiktok.com' in url or 'vm.tiktok' in url or 'vt.tiktok' in url:
-            try:
-                resolved_url = requests.head(raw_url, allow_redirects=True, timeout=8).url
-                video_id_match = re.search(r'/video/(\d+)', resolved_url)
-                if video_id_match:
-                    video_id_tk = video_id_match.group(1)
-                    direct_api = f"https://tiktokv.com{video_id_tk}"
-                    res = requests.get(direct_api, timeout=10).json()
-                    play_addr = res['aweme_list']['video']['play_addr']['url_list']
-                    video_data = requests.get(play_addr, headers={'User-Agent': 'Mozilla/5.0'}, timeout=15).content
-                    
-                    with open('downloaded_media.mp4', 'wb') as f:
-                        f.write(video_data)
-                    with open('downloaded_media.mp4', 'rb') as video:
-                        await bot.send_video(message.chat.id, video, reply_to_message_id=message.message_id)
-                    os.remove('downloaded_media.mp4')
-                    return
-            except Exception:
-                pass
-
-        # 3. DIRECT PIPELINE FOR INSTAGRAM
-        if 'instagram.com' in url and any(x in url for x in ['/reel/', '/p/', '/tv/']):
-            try:
-                clean_url = raw_url.split('?')
-                if not clean_url.endswith('/'):
-                    clean_url += '/'
-                embed_url = f"{clean_url}embed/captioned/"
-                res = requests.get(embed_url, timeout=8)
-                if res.status_code == 200:
-                    match_mp4 = re.search(r'"video_url":"([^"]+)"', res.text)
-                    if match_mp4:
-                        direct_mp4 = match_mp4.group(1).replace('\\u0025', '%').replace('\\u0026', '&').replace('\\', '')
-                        video_data = requests.get(direct_mp4, timeout=12).content
-                        with open('downloaded_media.mp4', 'wb') as f:
-                            f.write(video_data)
-                        with open('downloaded_media.mp4', 'rb') as video:
-                            await bot.send_video(message.chat.id, video, reply_to_message_id=message.message_id)
-                        os.remove('downloaded_media.mp4')
-                        return
-            except Exception:
-                pass
-
-        print("The request could not be fulfilled through the active data links.")
+        print("File downloaded to local container memory safely. Transferring to Telegram...")
+        
+        try:
+            with open('test_media.mp4', 'rb') as video:
+                await bot.send_video(message.chat.id, video, reply_to_message_id=message.message_id)
+            print("Video delivered successfully as an inline clip!")
+        except Exception as upload_err:
+            print(f"Inline upload failed, trying uncompressed file format attachment: {upload_err}")
+            with open('test_media.mp4', 'rb') as video_file:
+                await bot.send_document(message.chat.id, video_file, reply_to_message_id=message.message_id)
+            print("Video delivered successfully as a file document attachment!")
+                
+        os.remove('test_media.mp4')
+    except Exception as err:
+        print(f"File writing process failed: {err}")
+        if os.path.exists('test_media.mp4'):
+            os.remove('test_media.mp4')
 
 async def main():
     try:
         await bot.delete_webhook(drop_pending_updates=True)
     except Exception:
         pass
-    print("Bot is officially online, isolated, and running cleanly on Railway!")
+    print("Test bot initialized. Send ANY message to fire the test download loop!")
     await bot.polling(non_stop=True, timeout=90)
 
 if __name__ == "__main__":
     asyncio.run(main())
-
