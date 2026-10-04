@@ -34,7 +34,7 @@ PROXY = os.getenv("PROXY")                # optional, e.g. http://user:pass@host
 MAX_MB = int(os.getenv("MAX_MB", "300"))                       # biggest file we will send
 MAX_BYTES = MAX_MB * 1024 * 1024
 MAX_HEIGHT = int(os.getenv("MAX_HEIGHT", "480"))               # default quality cap
-COMPRESS_OVER_MB = int(os.getenv("COMPRESS_OVER_MB", "40"))    # squeeze videos bigger than this
+COMPRESS_MIN_MINUTES = int(os.getenv("COMPRESS_MIN_MINUTES", "10"))  # only videos at least this long get compressed
 COMPRESS_PRESET = os.getenv("COMPRESS_PRESET", "veryfast")     # ultrafast = quicker but bigger files
 LONG_SECONDS = int(os.getenv("LONG_SECONDS", "300"))           # YouTube videos longer than this get quality buttons
 MAX_PARALLEL = int(os.getenv("MAX_PARALLEL", "2"))             # downloads at the same time
@@ -325,10 +325,22 @@ def fetch_video(url: str, outdir: str, height=None) -> str:
 
 
 # ------------------------------------------------------------------ compression
+def video_duration(path: str) -> float:
+    """Length of a video file in seconds (0 if unknown)."""
+    try:
+        r = subprocess.run([FFMPEG, "-i", path], capture_output=True, text=True, timeout=60)
+        m = re.search(r"Duration: (\d+):(\d+):(\d+(?:\.\d+)?)", r.stderr)
+        if m:
+            return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+    except Exception as e:
+        print(f"Could not read duration: {e}")
+    return 0
+
+
 def maybe_compress(path: str) -> str:
-    """Re-encode big videos to a smaller, still watchable file. Returns the path to send."""
+    """Re-encode a video to a smaller, still watchable file. Returns the path to send."""
     size = os.path.getsize(path)
-    if not FFMPEG or size <= COMPRESS_OVER_MB * 1024 * 1024:
+    if not FFMPEG:
         return path
     out = os.path.join(os.path.dirname(path), "compressed.mp4")
     h = MAX_HEIGHT
@@ -391,11 +403,13 @@ async def process_and_send(chat_id, reply_to, url, height=None, status=None):
                 try:
                     await say(status, "Downloading...")
                     path = await asyncio.to_thread(fetch_video, url, tmp, height)
-                    if (height is None and FFMPEG
-                            and os.path.getsize(path) > COMPRESS_OVER_MB * 1024 * 1024):
-                        mb = os.path.getsize(path) // (1024 * 1024)
-                        await say(status, f"Compressing ({mb} MB)... this is the slow part.")
-                        path = await asyncio.to_thread(maybe_compress, path)
+                    if height is None and FFMPEG:
+                        dur = await asyncio.to_thread(video_duration, path)
+                        print(f"Downloaded video length: {int(dur)}s")
+                        if dur >= COMPRESS_MIN_MINUTES * 60:
+                            mb = os.path.getsize(path) // (1024 * 1024)
+                            await say(status, f"Compressing ({mb} MB)... this is the slow part.")
+                            path = await asyncio.to_thread(maybe_compress, path)
                 except Exception as e:
                     print(f"Download failed for {url}: {e}")
                     await say(status, friendly_error(e))
@@ -508,7 +522,7 @@ async def main():
     await client.start(bot_token=BOT_TOKEN)
     print(f"Bot is online. yt-dlp {yt_dlp.version.__version__}, cookies: {bool(COOKIE_FILE)}, "
           f"ffmpeg: {bool(FFMPEG)}, limit: {MAX_MB} MB, max height: {MAX_HEIGHT}p, "
-          f"compress over: {COMPRESS_OVER_MB} MB, buttons for videos over: {LONG_SECONDS}s")
+          f"compress videos of {COMPRESS_MIN_MINUTES}+ min, buttons for videos over: {LONG_SECONDS}s")
     await client.run_until_disconnected()
 
 
