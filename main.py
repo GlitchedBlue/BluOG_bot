@@ -8,6 +8,7 @@ import shutil
 import asyncio
 import tempfile
 import subprocess
+from urllib.parse import urlparse
 
 import requests
 
@@ -36,14 +37,31 @@ MAX_BYTES = MAX_MB * 1024 * 1024
 MAX_HEIGHT = int(os.getenv("MAX_HEIGHT", "480"))               # default quality cap
 COMPRESS_MIN_MINUTES = int(os.getenv("COMPRESS_MIN_MINUTES", "10"))  # only videos at least this long get compressed
 COMPRESS_PRESET = os.getenv("COMPRESS_PRESET", "veryfast")     # ultrafast = quicker but bigger files
-LONG_SECONDS = int(os.getenv("LONG_SECONDS", "300"))           # YouTube videos longer than this get quality buttons
+LONG_SECONDS = int(os.getenv("LONG_SECONDS", "0"))           # YouTube videos longer than this get quality buttons
 MAX_PARALLEL = int(os.getenv("MAX_PARALLEL", "2"))             # downloads at the same time
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))                     # your Telegram user ID: the bot DMs you who uses it
+
+# ---- Adult sites: only for approved people, and only in private chats by default ----
+# ADULT_ALLOWED_IDS: comma-separated Telegram user IDs (the owner is always allowed).
+ADULT_ALLOWED_IDS = {int(x) for x in os.getenv("ADULT_ALLOWED_IDS", "").replace(" ", "").split(",") if x.isdigit()}
+ADULT_ALLOW_GROUPS = os.getenv("ADULT_ALLOW_GROUPS", "0") == "1"
+ADULT_DOMAINS = [
+    "pornhub.com", "pornhub.org", "xvideos.com", "xnxx.com", "xhamster.com", "redtube.com",
+    "youporn.com", "spankbang.com", "tube8.com", "eporner.com", "tnaflix.com",
+] + [d.strip().lower() for d in os.getenv("ADULT_EXTRA_DOMAINS", "").split(",") if d.strip()]
 
 URL_REGEX = re.compile(r"https?://[^\s]+")
 PLATFORMS = (
     "instagram.com", "tiktok.com", "youtube.com", "youtu.be", "facebook.com", "fb.watch",
 )
+
+
+def is_adult_url(url: str) -> bool:
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        return False
+    return any(host == d or host.endswith("." + d) for d in ADULT_DOMAINS)
 QUALITY_STEPS = (360, 480, 720, 1080)
 
 # Bundled ffmpeg (lets yt-dlp merge separate video + audio, and compress)
@@ -470,104 +488,4 @@ async def notify_owner(event, what: str):
             where = f"group: {getattr(chat, 'title', 'unknown')}"
         await client.send_message(
             OWNER_ID,
-            f"{name} {username}\nID: {event.sender_id}\n{where}\n{what}",
-            link_preview=False,
-        )
-    except Exception as e:
-        print(f"Owner notification failed: {e}")
-
-
-@client.on(events.NewMessage(incoming=True, pattern=r"^/id"))
-async def show_id(event):
-    await event.reply(f"Your Telegram ID: {event.sender_id}")
-
-
-@client.on(events.NewMessage(incoming=True, pattern=r"^/(start|help)"))
-async def start(event):
-    spawn(notify_owner(event, "started the bot"))
-    await event.reply("Send me an Instagram, TikTok or YouTube link and I'll send the video back. "
-                      "For long YouTube videos you can pick the quality.")
-
-
-@client.on(events.NewMessage(incoming=True))
-async def handle_messages(event):
-    text = event.raw_text or ""
-    if text.startswith("/"):
-        return
-    match = URL_REGEX.search(text)
-    if not match:
-        return
-    url = match.group(0)
-    low = url.lower()
-    if not any(p in low for p in PLATFORMS):
-        return
-
-    spawn(notify_owner(event, f"sent a link:\n{url}"))
-
-    # Instant feedback: this one message is updated all the way through, then deleted
-    status = await event.reply("Preparing your video...")
-
-    # Long YouTube videos: let the user pick the quality first
-    if "youtube.com" in low or "youtu.be" in low:
-        info = await asyncio.to_thread(get_youtube_info, url)
-        if info and (info.get("duration") or 0) > LONG_SECONDS and not info.get("is_live"):
-            options = quality_options(info)
-            if options:
-                prune_pending()
-                pid = uuid.uuid4().hex[:8]
-                pending[pid] = {
-                    "url": url, "chat": event.chat_id, "msg": event.id,
-                    "user": event.sender_id, "ts": time.time(),
-                    "labels": {str(v): lbl for v, lbl in options},
-                }
-                buttons = [Button.inline(lbl, data=f"q|{pid}|{v}".encode()) for v, lbl in options]
-                rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
-                title = (info.get("title") or "this video")[:80]
-                await say(
-                    status,
-                    f"{title}\nLength: {fmt_dur(info.get('duration'))}\n\n"
-                    f"Pick a quality (higher = better but slower to send):",
-                    buttons=rows,
-                )
-                return
-
-    await process_and_send(event.chat_id, event.id, url, None, status)
-
-
-@client.on(events.CallbackQuery(pattern=rb"^q\|"))
-async def on_quality(event):
-    try:
-        _, pid, choice = event.data.decode().split("|", 2)
-    except Exception:
-        return
-    req = pending.get(pid)
-    if not req:
-        await event.answer("This request expired. Send the link again.", alert=True)
-        return
-    if event.sender_id != req["user"]:
-        await event.answer("Only the person who sent the link can choose.", alert=True)
-        return
-    pending.pop(pid, None)          # stops double clicks
-    height = "audio" if choice == "audio" else int(choice)
-    label = req["labels"].get(choice, choice)
-    await event.answer()
-    status = await event.edit(f"Starting {label}...")
-    await process_and_send(req["chat"], req["msg"], req["url"], height, status)
-
-
-async def main():
-    global DL_SEM
-    if not (BOT_TOKEN and API_ID and API_HASH):
-        print("Missing BOT_TOKEN, API_ID or API_HASH. Set them as Railway variables.")
-        return
-    DL_SEM = asyncio.Semaphore(MAX_PARALLEL)
-    await client.start(bot_token=BOT_TOKEN)
-    print(f"Bot is online. yt-dlp {yt_dlp.version.__version__}, cookies: {bool(COOKIE_FILE)}, "
-          f"ffmpeg: {bool(FFMPEG)}, limit: {MAX_MB} MB, max height: {MAX_HEIGHT}p, "
-          f"compress videos of {COMPRESS_MIN_MINUTES}+ min, buttons for videos over: {LONG_SECONDS}s, "
-          f"owner alerts: {bool(OWNER_ID)}")
-    await client.run_until_disconnected()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+            f"{name} {username}\nID: {event.s
