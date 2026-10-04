@@ -35,6 +35,7 @@ MAX_MB = int(os.getenv("MAX_MB", "300"))                       # biggest file we
 MAX_BYTES = MAX_MB * 1024 * 1024
 MAX_HEIGHT = int(os.getenv("MAX_HEIGHT", "480"))               # default quality cap
 COMPRESS_OVER_MB = int(os.getenv("COMPRESS_OVER_MB", "40"))    # squeeze videos bigger than this
+COMPRESS_PRESET = os.getenv("COMPRESS_PRESET", "veryfast")     # ultrafast = quicker but bigger files
 LONG_SECONDS = int(os.getenv("LONG_SECONDS", "300"))           # YouTube videos longer than this get quality buttons
 MAX_PARALLEL = int(os.getenv("MAX_PARALLEL", "2"))             # downloads at the same time
 
@@ -85,6 +86,7 @@ def base_opts(outdir: str, height=None) -> dict:
         "no_warnings": True,
         "socket_timeout": 20,
         "retries": 2,
+        "concurrent_fragment_downloads": 4,
     }
     if FFMPEG:
         opts["ffmpeg_location"] = FFMPEG
@@ -334,7 +336,8 @@ def maybe_compress(path: str) -> str:
     cmd = [
         FFMPEG, "-y", "-i", path,
         "-vf", vf,
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "30", "-pix_fmt", "yuv420p",
+        "-threads", "0",
+        "-c:v", "libx264", "-preset", COMPRESS_PRESET, "-crf", "30", "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "96k",
         "-movflags", "+faststart",
         out,
@@ -364,28 +367,64 @@ def friendly_error(e: Exception) -> str:
     return "Couldn't download that video. It may be private or the site blocked the request."
 
 
-async def process_and_send(chat_id, reply_to, url, height=None):
-    """Download, (maybe) compress and send. Returns None on success, or an error text."""
+async def say(status, text, **kwargs):
+    """Update the status message; never let a failed edit break the download."""
+    if status is None:
+        return
+    try:
+        await status.edit(text, **kwargs)
+    except Exception as e:
+        if "not modified" not in str(e).lower():
+            print(f"status edit skipped: {e}")
+
+
+async def process_and_send(chat_id, reply_to, url, height=None, status=None):
+    """Download, (maybe) compress and send, keeping one status message updated.
+    The status message is deleted when the video is sent, or turned into an error text."""
     tmp = tempfile.mkdtemp(prefix="dl_")
     try:
+        queued = DL_SEM.locked()
+        if queued:
+            await say(status, "Queued, waiting for a free slot...")
         async with DL_SEM:
             async with client.action(chat_id, "audio" if height == "audio" else "video"):
                 try:
+                    await say(status, "Downloading...")
                     path = await asyncio.to_thread(fetch_video, url, tmp, height)
-                    if height is None:           # auto mode: squeeze big files
+                    if (height is None and FFMPEG
+                            and os.path.getsize(path) > COMPRESS_OVER_MB * 1024 * 1024):
+                        mb = os.path.getsize(path) // (1024 * 1024)
+                        await say(status, f"Compressing ({mb} MB)... this is the slow part.")
                         path = await asyncio.to_thread(maybe_compress, path)
                 except Exception as e:
                     print(f"Download failed for {url}: {e}")
-                    return friendly_error(e)
+                    await say(status, friendly_error(e))
+                    return
                 try:
+                    mb = os.path.getsize(path) // (1024 * 1024)
+                    await say(status, f"Uploading ({mb} MB)...")
+                    last = [0.0]
+
+                    async def progress(sent, total):
+                        now = time.time()
+                        if total and now - last[0] > 4:
+                            last[0] = now
+                            await say(status, f"Uploading... {int(sent * 100 / total)}%")
+
                     await client.send_file(
                         chat_id, path, reply_to=reply_to,
                         supports_streaming=(height != "audio"),
+                        progress_callback=progress,
                     )
                 except Exception as e:
                     print(f"Upload failed: {e}")
-                    return "Downloaded the video but Telegram refused the upload."
-        return None
+                    await say(status, "Downloaded the video but Telegram refused the upload.")
+                    return
+        if status is not None:
+            try:
+                await status.delete()
+            except Exception:
+                pass
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -409,10 +448,12 @@ async def handle_messages(event):
     if not any(p in low for p in PLATFORMS):
         return
 
+    # Instant feedback: this one message is updated all the way through, then deleted
+    status = await event.reply("Preparing your video...")
+
     # Long YouTube videos: let the user pick the quality first
     if "youtube.com" in low or "youtu.be" in low:
-        async with client.action(event.chat_id, "typing"):
-            info = await asyncio.to_thread(get_youtube_info, url)
+        info = await asyncio.to_thread(get_youtube_info, url)
         if info and (info.get("duration") or 0) > LONG_SECONDS and not info.get("is_live"):
             options = quality_options(info)
             if options:
@@ -426,16 +467,15 @@ async def handle_messages(event):
                 buttons = [Button.inline(lbl, data=f"q|{pid}|{v}".encode()) for v, lbl in options]
                 rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
                 title = (info.get("title") or "this video")[:80]
-                await event.reply(
+                await say(
+                    status,
                     f"{title}\nLength: {fmt_dur(info.get('duration'))}\n\n"
                     f"Pick a quality (higher = better but slower to send):",
                     buttons=rows,
                 )
                 return
 
-    err = await process_and_send(event.chat_id, event.id, url)
-    if err:
-        await event.reply(err)
+    await process_and_send(event.chat_id, event.id, url, None, status)
 
 
 @client.on(events.CallbackQuery(pattern=rb"^q\|"))
@@ -455,12 +495,8 @@ async def on_quality(event):
     height = "audio" if choice == "audio" else int(choice)
     label = req["labels"].get(choice, choice)
     await event.answer()
-    await event.edit(f"Downloading {label}... this can take a while.")
-    err = await process_and_send(req["chat"], req["msg"], req["url"], height)
-    if err:
-        await event.edit(err)
-    else:
-        await event.delete()
+    status = await event.edit(f"Starting {label}...")
+    await process_and_send(req["chat"], req["msg"], req["url"], height, status)
 
 
 async def main():
