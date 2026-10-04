@@ -38,6 +38,7 @@ COMPRESS_MIN_MINUTES = int(os.getenv("COMPRESS_MIN_MINUTES", "10"))  # only vide
 COMPRESS_PRESET = os.getenv("COMPRESS_PRESET", "veryfast")     # ultrafast = quicker but bigger files
 LONG_SECONDS = int(os.getenv("LONG_SECONDS", "300"))           # YouTube videos longer than this get quality buttons
 MAX_PARALLEL = int(os.getenv("MAX_PARALLEL", "2"))             # downloads at the same time
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))                     # your Telegram user ID: the bot DMs you who uses it
 
 URL_REGEX = re.compile(r"https?://[^\s]+")
 PLATFORMS = (
@@ -443,8 +444,47 @@ async def process_and_send(chat_id, reply_to, url, height=None, status=None):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+_bg_tasks = set()
+
+
+def spawn(coro):
+    """Run something in the background without slowing the download down."""
+    task = asyncio.create_task(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+
+
+async def notify_owner(event, what: str):
+    """DM the bot owner about who is using the bot (skips the owner themself)."""
+    if not OWNER_ID or event.sender_id == OWNER_ID:
+        return
+    try:
+        sender = await event.get_sender()
+        name = " ".join(x for x in (getattr(sender, "first_name", None),
+                                    getattr(sender, "last_name", None)) if x) or "Unknown"
+        username = f"@{sender.username}" if getattr(sender, "username", None) else "(no username)"
+        if event.is_private:
+            where = "private chat"
+        else:
+            chat = await event.get_chat()
+            where = f"group: {getattr(chat, 'title', 'unknown')}"
+        await client.send_message(
+            OWNER_ID,
+            f"{name} {username}\nID: {event.sender_id}\n{where}\n{what}",
+            link_preview=False,
+        )
+    except Exception as e:
+        print(f"Owner notification failed: {e}")
+
+
+@client.on(events.NewMessage(incoming=True, pattern=r"^/id"))
+async def show_id(event):
+    await event.reply(f"Your Telegram ID: {event.sender_id}")
+
+
 @client.on(events.NewMessage(incoming=True, pattern=r"^/(start|help)"))
 async def start(event):
+    spawn(notify_owner(event, "started the bot"))
     await event.reply("Send me an Instagram, TikTok or YouTube link and I'll send the video back. "
                       "For long YouTube videos you can pick the quality.")
 
@@ -461,6 +501,8 @@ async def handle_messages(event):
     low = url.lower()
     if not any(p in low for p in PLATFORMS):
         return
+
+    spawn(notify_owner(event, f"sent a link:\n{url}"))
 
     # Instant feedback: this one message is updated all the way through, then deleted
     status = await event.reply("Preparing your video...")
@@ -522,7 +564,8 @@ async def main():
     await client.start(bot_token=BOT_TOKEN)
     print(f"Bot is online. yt-dlp {yt_dlp.version.__version__}, cookies: {bool(COOKIE_FILE)}, "
           f"ffmpeg: {bool(FFMPEG)}, limit: {MAX_MB} MB, max height: {MAX_HEIGHT}p, "
-          f"compress videos of {COMPRESS_MIN_MINUTES}+ min, buttons for videos over: {LONG_SECONDS}s")
+          f"compress videos of {COMPRESS_MIN_MINUTES}+ min, buttons for videos over: {LONG_SECONDS}s, "
+          f"owner alerts: {bool(OWNER_ID)}")
     await client.run_until_disconnected()
 
 
