@@ -33,6 +33,11 @@ PROXY = os.getenv("PROXY")                # optional, e.g. http://user:pass@host
 MAX_MB = int(os.getenv("MAX_MB", "300"))
 MAX_BYTES = MAX_MB * 1024 * 1024
 
+# Quality knobs: videos are limited to this height (shorter side for vertical videos),
+# and anything bigger than COMPRESS_OVER_MB after download gets squeezed with ffmpeg.
+MAX_HEIGHT = int(os.getenv("MAX_HEIGHT", "480"))
+COMPRESS_OVER_MB = int(os.getenv("COMPRESS_OVER_MB", "40"))
+
 URL_REGEX = re.compile(r"https?://[^\s]+")
 PLATFORMS = (
     "instagram.com", "tiktok.com", "youtube.com", "youtu.be", "facebook.com", "fb.watch",
@@ -57,8 +62,9 @@ client = TelegramClient(StringSession(), API_ID, API_HASH)
 
 def base_opts(outdir: str) -> dict:
     if FFMPEG:
-        fmt = ("bv*[height<=720][vcodec^=avc1]+ba[ext=m4a]/b[height<=720][ext=mp4]/"
-               "bv*[height<=720]+ba/b[height<=720]/b")
+        h = MAX_HEIGHT
+        fmt = (f"bv*[height<={h}][vcodec^=avc1]+ba[ext=m4a]/b[height<={h}][ext=mp4]/"
+               f"bv*[height<={h}]+ba/b[height<={h}]/w")
     else:
         fmt = "b[ext=mp4]/b"
     opts = {
@@ -239,6 +245,35 @@ def fetch_video(url: str, outdir: str) -> str:
     raise RuntimeError(" | ".join(errors))
 
 
+def maybe_compress(path: str) -> str:
+    """Re-encode big videos to a smaller, still watchable file. Returns the path to send."""
+    size = os.path.getsize(path)
+    if not FFMPEG or size <= COMPRESS_OVER_MB * 1024 * 1024:
+        return path
+    out = os.path.join(os.path.dirname(path), "compressed.mp4")
+    h = MAX_HEIGHT
+    vf = f"scale='if(gt(iw,ih),-2,min(iw,{h}))':'if(gt(iw,ih),min(ih,{h}),-2)'"
+    cmd = [
+        FFMPEG, "-y", "-i", path,
+        "-vf", vf,
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "30", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "96k",
+        "-movflags", "+faststart",
+        out,
+    ]
+    print(f"Compressing {size // (1024 * 1024)} MB video to max {h}p")
+    try:
+        subprocess.run(cmd, check=True, timeout=900,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        new_size = os.path.getsize(out)
+        print(f"Compressed: {size // (1024 * 1024)} MB -> {new_size // (1024 * 1024)} MB")
+        if 0 < new_size < size:
+            return out
+    except Exception as e:
+        print(f"Compression failed, sending original: {e}")
+    return path
+
+
 @client.on(events.NewMessage(incoming=True, pattern=r"^/(start|help)"))
 async def start(event):
     await event.reply("Send me an Instagram, TikTok or YouTube link and I'll send the video back.")
@@ -261,6 +296,7 @@ async def handle_messages(event):
         async with client.action(event.chat_id, "video"):
             try:
                 path = await asyncio.to_thread(fetch_video, url, tmp)
+                path = await asyncio.to_thread(maybe_compress, path)
             except Exception as e:
                 print(f"Download failed for {url}: {e}")
                 msg = str(e).lower()
@@ -294,7 +330,8 @@ async def main():
         return
     await client.start(bot_token=BOT_TOKEN)
     print(f"Bot is online. yt-dlp {yt_dlp.version.__version__}, cookies: {bool(COOKIE_FILE)}, "
-          f"ffmpeg: {bool(FFMPEG)}, limit: {MAX_MB} MB")
+          f"ffmpeg: {bool(FFMPEG)}, limit: {MAX_MB} MB, max height: {MAX_HEIGHT}p, "
+          f"compress over: {COMPRESS_OVER_MB} MB")
     await client.run_until_disconnected()
 
 
