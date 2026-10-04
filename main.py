@@ -85,15 +85,29 @@ def run_ytdlp(opts: dict, url: str, outdir: str) -> str:
             os.remove(os.path.join(outdir, name))
         except OSError:
             pass
+    opts = dict(opts)
+    opts.pop("max_filesize", None)   # we check the size ourselves, so failures are explicit
     with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        path = ydl.prepare_filename(info)
-    if os.path.exists(path):
+        info = ydl.extract_info(url, download=False)
+        size = info.get("filesize") or info.get("filesize_approx")
+        print(f"yt-dlp picked format={info.get('format_id')} ext={info.get('ext')} "
+              f"res={info.get('width')}x{info.get('height')} size={size}")
+        if size and size > MAX_BYTES:
+            raise ValueError(f"video too large ({size // (1024 * 1024)} MB)")
+        done = ydl.process_ie_result(info, download=True)
+        path = None
+        for d in (done.get("requested_downloads") or []):
+            if d.get("filepath"):
+                path = d["filepath"]
+        if not path:
+            path = ydl.prepare_filename(done)
+    if path and os.path.exists(path):
         return path
-    for name in os.listdir(outdir):
+    leftovers = os.listdir(outdir)
+    for name in leftovers:
         if not name.endswith((".part", ".ytdl")):
             return os.path.join(outdir, name)
-    raise FileNotFoundError("yt-dlp produced no file")
+    raise FileNotFoundError(f"yt-dlp finished but no file found (folder has: {leftovers})")
 
 
 def ytdlp_download(url: str, outdir: str) -> str:
@@ -118,7 +132,7 @@ def ytdlp_download(url: str, outdir: str) -> str:
             errors.append(f"[{label}] {text}")
             low = text.lower()
             # File too big for Telegram: other attempts won't help, stop and say so.
-            if "produced no file" in low or "too large" in low or "larger than" in low or "max-filesize" in low:
+            if "too large" in low or "larger than" in low or "max-filesize" in low:
                 raise RuntimeError("video too large for Telegram (50 MB limit)")
     # Report the first (main) failure, not the noisy fallbacks
     raise RuntimeError(errors[0] if errors else "yt-dlp failed")
