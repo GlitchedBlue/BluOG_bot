@@ -45,6 +45,7 @@ OWNER_ID = int(os.getenv("OWNER_ID", "0"))                     # your Telegram u
 # ADULT_ALLOWED_IDS: comma-separated Telegram user IDs (the owner is always allowed).
 ADULT_ALLOWED_IDS = {int(x) for x in os.getenv("ADULT_ALLOWED_IDS", "").replace(" ", "").split(",") if x.isdigit()}
 ADULT_ALLOW_GROUPS = os.getenv("ADULT_ALLOW_GROUPS", "0") == "1"
+ADULT_OPEN = os.getenv("ADULT_OPEN", "1") == "1"   # 1 = anyone may use adult sites, 0 = only approved IDs
 ADULT_DOMAINS = [
     "pornhub.com", "pornhub.org", "xvideos.com", "xnxx.com", "xhamster.com", "redtube.com",
     "youporn.com", "spankbang.com", "tube8.com", "eporner.com", "tnaflix.com",
@@ -141,7 +142,34 @@ def est_size(info: dict):
     return None
 
 
+class CaptureLogger:
+    """Keeps yt-dlp/ffmpeg messages so a failure can show the real error in the logs."""
+
+    def __init__(self):
+        self.lines = []
+
+    def _add(self, msg):
+        for line in str(msg).splitlines():
+            if line.strip():
+                self.lines.append(line.strip()[:300])
+        del self.lines[:-60]
+
+    debug = info = warning = error = _add
+
+
 def run_ytdlp(opts: dict, url: str, outdir: str) -> str:
+    cap = CaptureLogger()
+    opts = dict(opts)
+    opts["logger"] = cap
+    try:
+        return _run_ytdlp(opts, url, outdir)
+    except Exception:
+        interesting = [l for l in cap.lines if not l.startswith(("lib", "built with", "configuration"))]
+        print("yt-dlp/ffmpeg output before failing: " + " | ".join(interesting[-15:]))
+        raise
+
+
+def _run_ytdlp(opts: dict, url: str, outdir: str) -> str:
     for name in os.listdir(outdir):
         try:
             os.remove(os.path.join(outdir, name))
@@ -176,6 +204,14 @@ def ytdlp_download(url: str, outdir: str, height=None) -> str:
         attempts = youtube_attempts(outdir, height)
     else:
         attempts = [("default", base_opts(outdir, height))]
+        # Streams (HLS) sometimes fail in yt-dlp's ffmpeg clean-up step, so try other ways too
+        o = base_opts(outdir, height)
+        o["hls_prefer_native"] = False
+        o["external_downloader"] = {"m3u8": "ffmpeg"}
+        attempts.append(("ffmpeg-downloader", o))
+        o = base_opts(outdir, height)
+        o["fixup"] = "never"
+        attempts.append(("no-fixup", o))
     errors = []
     for label, opts in attempts:
         try:
@@ -520,7 +556,8 @@ async def handle_messages(event):
         return
 
     if adult:
-        approved = (event.sender_id == OWNER_ID and OWNER_ID) or event.sender_id in ADULT_ALLOWED_IDS
+        approved = (ADULT_OPEN or bool(OWNER_ID and event.sender_id == OWNER_ID)
+                    or event.sender_id in ADULT_ALLOWED_IDS)
         if not approved or not (event.is_private or ADULT_ALLOW_GROUPS):
             host = urlparse(url).hostname
             spawn(notify_owner(event, f"tried a restricted site (blocked): {host}"))
