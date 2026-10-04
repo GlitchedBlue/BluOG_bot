@@ -2,6 +2,8 @@ import os
 import re
 import sys
 import json
+import time
+import uuid
 import shutil
 import asyncio
 import tempfile
@@ -19,7 +21,7 @@ except Exception as _e:
     print(f"yt-dlp upgrade skipped: {_e}")
 
 import yt_dlp  # noqa: E402  (imported after the upgrade on purpose)
-from telethon import TelegramClient, events  # noqa: E402
+from telethon import TelegramClient, events, Button  # noqa: E402
 from telethon.sessions import StringSession  # noqa: E402
 
 # ---- Settings (Railway variables) ----
@@ -29,21 +31,20 @@ API_HASH = os.getenv("API_HASH", "")
 YT_COOKIES = os.getenv("YT_COOKIES")      # full text of a cookies.txt (Netscape format), optional
 PROXY = os.getenv("PROXY")                # optional, e.g. http://user:pass@host:port
 
-# Telegram allows 2 GB for bots on the full protocol; we cap lower to protect Railway.
-MAX_MB = int(os.getenv("MAX_MB", "300"))
+MAX_MB = int(os.getenv("MAX_MB", "300"))                       # biggest file we will send
 MAX_BYTES = MAX_MB * 1024 * 1024
-
-# Quality knobs: videos are limited to this height (shorter side for vertical videos),
-# and anything bigger than COMPRESS_OVER_MB after download gets squeezed with ffmpeg.
-MAX_HEIGHT = int(os.getenv("MAX_HEIGHT", "480"))
-COMPRESS_OVER_MB = int(os.getenv("COMPRESS_OVER_MB", "40"))
+MAX_HEIGHT = int(os.getenv("MAX_HEIGHT", "480"))               # default quality cap
+COMPRESS_OVER_MB = int(os.getenv("COMPRESS_OVER_MB", "40"))    # squeeze videos bigger than this
+LONG_SECONDS = int(os.getenv("LONG_SECONDS", "300"))           # YouTube videos longer than this get quality buttons
+MAX_PARALLEL = int(os.getenv("MAX_PARALLEL", "2"))             # downloads at the same time
 
 URL_REGEX = re.compile(r"https?://[^\s]+")
 PLATFORMS = (
     "instagram.com", "tiktok.com", "youtube.com", "youtu.be", "facebook.com", "fb.watch",
 )
+QUALITY_STEPS = (360, 480, 720, 1080)
 
-# Bundled ffmpeg (lets yt-dlp merge separate video + audio for 720p)
+# Bundled ffmpeg (lets yt-dlp merge separate video + audio, and compress)
 FFMPEG = None
 try:
     import imageio_ffmpeg
@@ -58,15 +59,22 @@ if YT_COOKIES:
         f.write(YT_COOKIES)
 
 client = TelegramClient(StringSession(), API_ID, API_HASH)
+DL_SEM = None            # created in main() so it belongs to the running event loop
+pending = {}             # quality-button requests waiting for a click
 
 
-def base_opts(outdir: str) -> dict:
-    if FFMPEG:
-        h = MAX_HEIGHT
-        fmt = (f"bv*[height<={h}][vcodec^=avc1]+ba[ext=m4a]/b[height<={h}][ext=mp4]/"
-               f"bv*[height<={h}]+ba/b[height<={h}]/w")
+# ------------------------------------------------------------------ yt-dlp helpers
+def base_opts(outdir: str, height=None) -> dict:
+    """height: None = default cap, an int = max height, 'audio' = audio only."""
+    if height == "audio":
+        fmt = "ba[ext=m4a]/ba/b"
     else:
-        fmt = "b[ext=mp4]/b"
+        h = height or MAX_HEIGHT
+        if FFMPEG:
+            fmt = (f"bv*[height<={h}][vcodec^=avc1]+ba[ext=m4a]/b[height<={h}][ext=mp4]/"
+                   f"bv*[height<={h}]+ba/b[height<={h}]/w")
+        else:
+            fmt = f"b[height<={h}][ext=mp4]/b[ext=mp4]/b"
     opts = {
         "format": fmt,
         "outtmpl": os.path.join(outdir, "video.%(ext)s"),
@@ -85,18 +93,18 @@ def base_opts(outdir: str) -> dict:
     return opts
 
 
-def youtube_attempts(outdir: str):
+def youtube_attempts(outdir: str, height=None):
     """Different ways of asking YouTube, tried in order until one works."""
     attempts = []
     if COOKIE_FILE:
-        o = base_opts(outdir); o["cookiefile"] = COOKIE_FILE
+        o = base_opts(outdir, height); o["cookiefile"] = COOKIE_FILE
         attempts.append(("cookies+default", o))
         for c in ("mweb", "web_safari", "tv"):
-            o = base_opts(outdir); o["cookiefile"] = COOKIE_FILE
+            o = base_opts(outdir, height); o["cookiefile"] = COOKIE_FILE
             o["extractor_args"] = {"youtube": {"player_client": [c]}}
             attempts.append((f"cookies+{c}", o))
     for c in ("android_vr", "tv_simply", "ios"):
-        o = base_opts(outdir)
+        o = base_opts(outdir, height)
         o["extractor_args"] = {"youtube": {"player_client": [c]}}
         attempts.append((f"nocookies+{c}", o))
     return attempts
@@ -141,12 +149,12 @@ def run_ytdlp(opts: dict, url: str, outdir: str) -> str:
     raise FileNotFoundError(f"yt-dlp finished but no file found (folder has: {leftovers})")
 
 
-def ytdlp_download(url: str, outdir: str) -> str:
+def ytdlp_download(url: str, outdir: str, height=None) -> str:
     low = url.lower()
     if "youtube.com" in low or "youtu.be" in low:
-        attempts = youtube_attempts(outdir)
+        attempts = youtube_attempts(outdir, height)
     else:
-        attempts = [("default", base_opts(outdir))]
+        attempts = [("default", base_opts(outdir, height))]
     errors = []
     for label, opts in attempts:
         try:
@@ -164,6 +172,75 @@ def ytdlp_download(url: str, outdir: str) -> str:
     raise RuntimeError(errors[0] if errors else "yt-dlp failed")
 
 
+# ------------------------------------------------------------------ quality buttons
+def get_youtube_info(url: str):
+    """Fetch title/duration/formats without downloading. Returns None if it can't."""
+    for label, opts in youtube_attempts("/tmp"):
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                # process=False skips format selection, so this can't fail on format choice
+                info = ydl.extract_info(url, download=False, process=False)
+            if info and info.get("duration") is not None:
+                return info
+        except Exception as e:
+            print(f"info attempt '{label}' failed: {e}")
+    return None
+
+
+def _fsize(f: dict, duration: float):
+    s = f.get("filesize") or f.get("filesize_approx")
+    if not s and f.get("tbr") and duration:
+        s = f["tbr"] * 1000 / 8 * duration
+    return s
+
+
+def quality_options(info: dict):
+    """List of (button_value, label) the user can pick from."""
+    dur = info.get("duration") or 0
+    fmts = info.get("formats") or []
+    video = [f for f in fmts if f.get("vcodec") not in (None, "none") and f.get("height")]
+    audio = [f for f in fmts if f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none")]
+    best_audio = max(audio, key=lambda f: f.get("abr") or f.get("tbr") or 0, default=None)
+    a_size = (_fsize(best_audio, dur) or 0) if best_audio else 0
+
+    options, seen = [], set()
+    for h in QUALITY_STEPS:
+        cands = [f for f in video if f["height"] <= h]
+        if not cands:
+            continue
+        actual = max(f["height"] for f in cands)
+        if actual in seen:
+            continue
+        top = [f for f in cands if f["height"] == actual]
+        avc = [f for f in top if str(f.get("vcodec", "")).startswith("avc1")]
+        pool = avc or top
+        sizes = [s for s in (_fsize(f, dur) for f in pool) if s]
+        size = (min(sizes) + a_size) if sizes else None
+        if size and size > MAX_BYTES and options:
+            continue            # too big to send, but always keep the lowest option
+        seen.add(actual)
+        label = f"{actual}p" + (f"  ~{int(size / 1024 / 1024)} MB" if size else "")
+        options.append((h, label))
+    if best_audio:
+        a_label = "Audio only" + (f"  ~{int(a_size / 1024 / 1024)} MB" if a_size else "")
+        options.append(("audio", a_label))
+    return options
+
+
+def fmt_dur(sec) -> str:
+    sec = int(sec or 0)
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def prune_pending():
+    now = time.time()
+    for k in [k for k, v in pending.items() if now - v["ts"] > 3600]:
+        pending.pop(k, None)
+
+
+# ------------------------------------------------------------------ other platforms
 def tiktok_fallback_download(url: str, outdir: str) -> str:
     """Third-party resolver used when yt-dlp is blocked by TikTok."""
     clean = url.split("?")[0]
@@ -219,7 +296,7 @@ def instagram_embed_download(url: str, outdir: str) -> str:
     return path
 
 
-def fetch_video(url: str, outdir: str) -> str:
+def fetch_video(url: str, outdir: str, height=None) -> str:
     low = url.lower()
     errors = []
     if "instagram.com" in low:
@@ -230,7 +307,7 @@ def fetch_video(url: str, outdir: str) -> str:
     if "tiktok.com" in low:
         url = url.split("?")[0]   # drop tracking junk like ?is_from_webapp=1
     try:
-        return ytdlp_download(url, outdir)
+        return ytdlp_download(url, outdir, height)
     except Exception as e:
         errors.append(f"yt-dlp: {e}")
         if "too large" in str(e).lower():
@@ -245,6 +322,7 @@ def fetch_video(url: str, outdir: str) -> str:
     raise RuntimeError(" | ".join(errors))
 
 
+# ------------------------------------------------------------------ compression
 def maybe_compress(path: str) -> str:
     """Re-encode big videos to a smaller, still watchable file. Returns the path to send."""
     size = os.path.getsize(path)
@@ -274,9 +352,48 @@ def maybe_compress(path: str) -> str:
     return path
 
 
+# ------------------------------------------------------------------ bot logic
+def friendly_error(e: Exception) -> str:
+    msg = str(e).lower()
+    if "too large" in msg:
+        return f"That video is over my {MAX_MB} MB limit. Try a lower quality."
+    if "sign in" in msg or "confirm you" in msg:
+        return "YouTube wants a login from this server. The bot owner needs to refresh the cookies."
+    if "needs to be reloaded" in msg:
+        return "YouTube rejected the request from this server. Try again in a bit."
+    return "Couldn't download that video. It may be private or the site blocked the request."
+
+
+async def process_and_send(chat_id, reply_to, url, height=None):
+    """Download, (maybe) compress and send. Returns None on success, or an error text."""
+    tmp = tempfile.mkdtemp(prefix="dl_")
+    try:
+        async with DL_SEM:
+            async with client.action(chat_id, "audio" if height == "audio" else "video"):
+                try:
+                    path = await asyncio.to_thread(fetch_video, url, tmp, height)
+                    if height is None:           # auto mode: squeeze big files
+                        path = await asyncio.to_thread(maybe_compress, path)
+                except Exception as e:
+                    print(f"Download failed for {url}: {e}")
+                    return friendly_error(e)
+                try:
+                    await client.send_file(
+                        chat_id, path, reply_to=reply_to,
+                        supports_streaming=(height != "audio"),
+                    )
+                except Exception as e:
+                    print(f"Upload failed: {e}")
+                    return "Downloaded the video but Telegram refused the upload."
+        return None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 @client.on(events.NewMessage(incoming=True, pattern=r"^/(start|help)"))
 async def start(event):
-    await event.reply("Send me an Instagram, TikTok or YouTube link and I'll send the video back.")
+    await event.reply("Send me an Instagram, TikTok or YouTube link and I'll send the video back. "
+                      "For long YouTube videos you can pick the quality.")
 
 
 @client.on(events.NewMessage(incoming=True))
@@ -288,50 +405,74 @@ async def handle_messages(event):
     if not match:
         return
     url = match.group(0)
-    if not any(p in url.lower() for p in PLATFORMS):
+    low = url.lower()
+    if not any(p in low for p in PLATFORMS):
         return
 
-    tmp = tempfile.mkdtemp(prefix="dl_")
-    try:
-        async with client.action(event.chat_id, "video"):
-            try:
-                path = await asyncio.to_thread(fetch_video, url, tmp)
-                path = await asyncio.to_thread(maybe_compress, path)
-            except Exception as e:
-                print(f"Download failed for {url}: {e}")
-                msg = str(e).lower()
-                if "too large" in msg:
-                    reply = f"That video is over my {MAX_MB} MB limit."
-                elif "sign in" in msg or "confirm you" in msg:
-                    reply = "YouTube wants a login from this server. The bot owner needs to refresh the cookies."
-                elif "needs to be reloaded" in msg:
-                    reply = "YouTube rejected the request from this server. Try again in a bit."
-                else:
-                    reply = "Couldn't download that video. It may be private or the site blocked the request."
-                await event.reply(reply)
+    # Long YouTube videos: let the user pick the quality first
+    if "youtube.com" in low or "youtu.be" in low:
+        async with client.action(event.chat_id, "typing"):
+            info = await asyncio.to_thread(get_youtube_info, url)
+        if info and (info.get("duration") or 0) > LONG_SECONDS and not info.get("is_live"):
+            options = quality_options(info)
+            if options:
+                prune_pending()
+                pid = uuid.uuid4().hex[:8]
+                pending[pid] = {
+                    "url": url, "chat": event.chat_id, "msg": event.id,
+                    "user": event.sender_id, "ts": time.time(),
+                    "labels": {str(v): lbl for v, lbl in options},
+                }
+                buttons = [Button.inline(lbl, data=f"q|{pid}|{v}".encode()) for v, lbl in options]
+                rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+                title = (info.get("title") or "this video")[:80]
+                await event.reply(
+                    f"{title}\nLength: {fmt_dur(info.get('duration'))}\n\n"
+                    f"Pick a quality (higher = better but slower to send):",
+                    buttons=rows,
+                )
                 return
 
-            try:
-                await client.send_file(
-                    event.chat_id, path,
-                    reply_to=event.id,
-                    supports_streaming=True,
-                )
-            except Exception as e:
-                print(f"Upload failed: {e}")
-                await event.reply("Downloaded the video but Telegram refused the upload.")
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+    err = await process_and_send(event.chat_id, event.id, url)
+    if err:
+        await event.reply(err)
+
+
+@client.on(events.CallbackQuery(pattern=rb"^q\|"))
+async def on_quality(event):
+    try:
+        _, pid, choice = event.data.decode().split("|", 2)
+    except Exception:
+        return
+    req = pending.get(pid)
+    if not req:
+        await event.answer("This request expired. Send the link again.", alert=True)
+        return
+    if event.sender_id != req["user"]:
+        await event.answer("Only the person who sent the link can choose.", alert=True)
+        return
+    pending.pop(pid, None)          # stops double clicks
+    height = "audio" if choice == "audio" else int(choice)
+    label = req["labels"].get(choice, choice)
+    await event.answer()
+    await event.edit(f"Downloading {label}... this can take a while.")
+    err = await process_and_send(req["chat"], req["msg"], req["url"], height)
+    if err:
+        await event.edit(err)
+    else:
+        await event.delete()
 
 
 async def main():
+    global DL_SEM
     if not (BOT_TOKEN and API_ID and API_HASH):
         print("Missing BOT_TOKEN, API_ID or API_HASH. Set them as Railway variables.")
         return
+    DL_SEM = asyncio.Semaphore(MAX_PARALLEL)
     await client.start(bot_token=BOT_TOKEN)
     print(f"Bot is online. yt-dlp {yt_dlp.version.__version__}, cookies: {bool(COOKIE_FILE)}, "
           f"ffmpeg: {bool(FFMPEG)}, limit: {MAX_MB} MB, max height: {MAX_HEIGHT}p, "
-          f"compress over: {COMPRESS_OVER_MB} MB")
+          f"compress over: {COMPRESS_OVER_MB} MB, buttons for videos over: {LONG_SECONDS}s")
     await client.run_until_disconnected()
 
 
