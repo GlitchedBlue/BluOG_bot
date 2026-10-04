@@ -44,9 +44,11 @@ if YT_COOKIES:
 def base_opts(outdir: str) -> dict:
     opts = {
         # Single-file formats only (no ffmpeg needed), small enough for Telegram
-        "format": "best[ext=mp4][filesize<48M]/best[ext=mp4][filesize_approx<48M]/best[height<=480][ext=mp4]/best[ext=mp4]/best",
+        # Best quality that fits; if sizes are unknown, fall back to the smallest version
+        "format": "best[ext=mp4][filesize<48M]/best[ext=mp4][filesize_approx<48M]/worst[ext=mp4]/worst",
         "outtmpl": os.path.join(outdir, "video.%(ext)s"),
         "noplaylist": True,
+        "noprogress": True,
         "quiet": True,
         "no_warnings": True,
         "socket_timeout": 20,
@@ -106,11 +108,47 @@ def ytdlp_download(url: str, outdir: str) -> str:
     for label, opts in attempts:
         try:
             print(f"yt-dlp attempt: {label}")
-            return run_ytdlp(opts, url, outdir)
+            path = run_ytdlp(opts, url, outdir)
+            if os.path.getsize(path) > MAX_BYTES:
+                raise ValueError("video too large")
+            return path
         except Exception as e:
-            print(f"yt-dlp attempt '{label}' failed: {e}")
-            errors.append(f"[{label}] {e}")
-    raise RuntimeError(" | ".join(errors))
+            text = str(e)
+            print(f"yt-dlp attempt '{label}' failed: {text}")
+            errors.append(f"[{label}] {text}")
+            low = text.lower()
+            # File too big for Telegram: other attempts won't help, stop and say so.
+            if "produced no file" in low or "too large" in low or "larger than" in low or "max-filesize" in low:
+                raise RuntimeError("video too large for Telegram (50 MB limit)")
+    # Report the first (main) failure, not the noisy fallbacks
+    raise RuntimeError(errors[0] if errors else "yt-dlp failed")
+
+
+def tiktok_fallback_download(url: str, outdir: str) -> str:
+    """Third-party resolver used when yt-dlp is blocked by TikTok."""
+    clean = url.split("?")[0]
+    proxies = {"http": PROXY, "https": PROXY} if PROXY else None
+    res = requests.get("https://www.tikwm.com/api/", params={"url": clean, "hd": 0},
+                       headers={"User-Agent": "Mozilla/5.0"}, timeout=20, proxies=proxies)
+    res.raise_for_status()
+    data = res.json().get("data") or {}
+    play = data.get("play")
+    if not play:
+        raise ValueError(f"fallback returned no video: {res.text[:200]}")
+    if play.startswith("/"):
+        play = "https://www.tikwm.com" + play
+    path = os.path.join(outdir, "video.mp4")
+    with requests.get(play, headers={"User-Agent": "Mozilla/5.0"}, stream=True,
+                      timeout=30, proxies=proxies) as r:
+        r.raise_for_status()
+        size = 0
+        with open(path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=65536):
+                size += len(chunk)
+                if size > MAX_BYTES:
+                    raise ValueError("video too large")
+                f.write(chunk)
+    return path
 
 
 def instagram_embed_download(url: str, outdir: str) -> str:
@@ -149,10 +187,21 @@ def fetch_video(url: str, outdir: str) -> str:
             return instagram_embed_download(url, outdir)
         except Exception as e:
             errors.append(f"embed: {e}")
+    if "tiktok.com" in low:
+        url = url.split("?")[0]   # drop tracking junk like ?is_from_webapp=1
     try:
         return ytdlp_download(url, outdir)
     except Exception as e:
         errors.append(f"yt-dlp: {e}")
+        if "too large" in str(e).lower():
+            raise RuntimeError(" | ".join(errors))
+    if "tiktok.com" in low:
+        try:
+            print("TikTok: trying fallback resolver")
+            return tiktok_fallback_download(url, outdir)
+        except Exception as e:
+            print(f"TikTok fallback failed: {e}")
+            errors.append(f"tiktok-fallback: {e}")
     raise RuntimeError(" | ".join(errors))
 
 
@@ -181,12 +230,12 @@ async def handle_messages(message):
         except Exception as e:
             print(f"Download failed for {url}: {e}")
             msg = str(e).lower()
-            if "sign in" in msg or "confirm you" in msg:
+            if "too large" in msg or "larger than" in msg or "max-filesize" in msg:
+                text = "That video is over Telegram's 50 MB bot limit."
+            elif "sign in" in msg or "confirm you" in msg:
                 text = "YouTube wants a login from this server. The bot owner needs to refresh the cookies."
             elif "needs to be reloaded" in msg:
                 text = "YouTube rejected the request from this server. Try again in a bit."
-            elif "larger than" in msg or "too large" in msg or "max-filesize" in msg:
-                text = "That video is over Telegram's 50 MB bot limit."
             else:
                 text = "Couldn't download that video. It may be private or the site blocked the request."
             await bot.reply_to(message, text)
