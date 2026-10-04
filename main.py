@@ -7,6 +7,8 @@ import uuid
 import shutil
 import asyncio
 import tempfile
+import socket
+import ipaddress
 import subprocess
 from urllib.parse import urlparse
 
@@ -41,37 +43,49 @@ LONG_SECONDS = int(os.getenv("LONG_SECONDS", "0"))           # YouTube videos lo
 MAX_PARALLEL = int(os.getenv("MAX_PARALLEL", "2"))             # downloads at the same time
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))                     # your Telegram user ID: the bot DMs you who uses it
 
-# ---- Adult sites: only for approved people, and only in private chats by default ----
-# ADULT_ALLOWED_IDS: comma-separated Telegram user IDs (the owner is always allowed).
-ADULT_ALLOWED_IDS = {int(x) for x in os.getenv("ADULT_ALLOWED_IDS", "").replace(" ", "").split(",") if x.isdigit()}
-ADULT_ALLOW_GROUPS = os.getenv("ADULT_ALLOW_GROUPS", "0") == "1"
-ADULT_OPEN = os.getenv("ADULT_OPEN", "1") == "1"   # 1 = anyone may use adult sites, 0 = only approved IDs
-ADULT_DOMAINS = [
-    "pornhub.com", "pornhub.org", "xvideos.com", "xnxx.com", "xhamster.com", "redtube.com",
-    "youporn.com", "spankbang.com", "tube8.com", "eporner.com", "tnaflix.com",
-] + [d.strip().lower() for d in os.getenv("ADULT_EXTRA_DOMAINS", "").split(",") if d.strip()]
+# ---- Links ----
+# Private chats: the bot tries any link that points to a video.
+# Groups: only the big platforms below, unless ANY_LINK_IN_GROUPS=1 (random links in a group
+# are usually not meant for the bot).
+ANY_LINK_IN_GROUPS = os.getenv("ANY_LINK_IN_GROUPS", "0") == "1"
 
 URL_REGEX = re.compile(r"https?://[^\s]+")
 PLATFORMS = (
     "instagram.com", "tiktok.com", "youtube.com", "youtu.be", "facebook.com", "fb.watch",
 )
+MEDIA_EXTS = (".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi", ".flv", ".ts", ".3gp",
+              ".mp3", ".m4a", ".ogg", ".opus", ".wav", ".aac")
 
 
-def is_adult_url(url: str) -> bool:
+def url_is_safe(url: str) -> bool:
+    """Only public http(s) addresses: never localhost, private networks or cloud metadata."""
     try:
-        host = (urlparse(url).hostname or "").lower()
+        parts = urlparse(url)
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            return False
+        host = parts.hostname.lower()
+        if host == "localhost" or host.endswith((".local", ".internal", ".localhost")):
+            return False
+        for info in socket.getaddrinfo(host, None):
+            ip = ipaddress.ip_address(info[4][0].split("%")[0])
+            if (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast
+                    or ip.is_reserved or ip.is_unspecified):
+                return False
+        return True
     except Exception:
         return False
-    return any(host == d or host.endswith("." + d) for d in ADULT_DOMAINS)
+
+
 QUALITY_STEPS = (360, 480, 720, 1080)
 
 # Bundled ffmpeg (lets yt-dlp merge separate video + audio, and compress)
-FFMPEG = None
-try:
-    import imageio_ffmpeg
-    FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
-except Exception as _e:
-    print(f"ffmpeg not available, falling back to single-file formats: {_e}")
+FFMPEG = shutil.which("ffmpeg")      # a real system ffmpeg is the most reliable
+if not FFMPEG:
+    try:
+        import imageio_ffmpeg
+        FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception as _e:
+        print(f"ffmpeg not available, falling back to single-file formats: {_e}")
 
 COOKIE_FILE = None
 if YT_COOKIES:
@@ -203,7 +217,15 @@ def ytdlp_download(url: str, outdir: str, height=None) -> str:
     if "youtube.com" in low or "youtu.be" in low:
         attempts = youtube_attempts(outdir, height)
     else:
-        attempts = [("default", base_opts(outdir, height))]
+        attempts = []
+        if height != "audio":
+            # A plain MP4 file is best: no stream re-assembly, no ffmpeg needed
+            o = base_opts(outdir, height)
+            h = height or MAX_HEIGHT
+            o["format"] = (f"b[height<=?{h}][ext=mp4][protocol=https]/"
+                           f"b[height<=?{h}][ext=mp4][protocol=http]")
+            attempts.append(("direct-mp4", o))
+        attempts.append(("default", base_opts(outdir, height)))
         # Streams (HLS) sometimes fail in yt-dlp's ffmpeg clean-up step, so try other ways too
         o = base_opts(outdir, height)
         o["hls_prefer_native"] = False
@@ -213,6 +235,7 @@ def ytdlp_download(url: str, outdir: str, height=None) -> str:
         o["fixup"] = "never"
         attempts.append(("no-fixup", o))
     errors = []
+    by_label = {}
     for label, opts in attempts:
         try:
             print(f"yt-dlp attempt: {label}")
@@ -224,9 +247,11 @@ def ytdlp_download(url: str, outdir: str, height=None) -> str:
             text = str(e)
             print(f"yt-dlp attempt '{label}' failed: {text}")
             errors.append(f"[{label}] {text}")
+            by_label[label] = text
             if "too large" in text.lower():
                 raise RuntimeError(f"video too large (over {MAX_MB} MB limit)")
-    raise RuntimeError(errors[0] if errors else "yt-dlp failed")
+    main_error = by_label.get("default") or by_label.get("cookies+default") or (errors[0] if errors else "yt-dlp failed")
+    raise RuntimeError(main_error)
 
 
 # ------------------------------------------------------------------ quality buttons
@@ -461,7 +486,7 @@ def friendly_error(e: Exception) -> str:
         return "YouTube wants a login from this server. The bot owner needs to refresh the cookies."
     if "needs to be reloaded" in msg:
         return "YouTube rejected the request from this server. Try again in a bit."
-    return "Couldn't download that video. It may be private or the site blocked the request."
+    return "Couldn't get a video from that link. It may be private, unsupported, or blocked."
 
 
 async def say(status, text, **kwargs):
@@ -490,6 +515,8 @@ async def process_and_send(chat_id, reply_to, url, height=None, status=None):
                     path = await asyncio.to_thread(fetch_video, url, tmp, height)
                     if height != "audio":
                         path = await asyncio.to_thread(ensure_mp4, path)
+                    if not path.lower().endswith(MEDIA_EXTS):
+                        raise RuntimeError("that link did not give a video file")
                     if height is None and FFMPEG:
                         dur = await asyncio.to_thread(video_duration, path)
                         print(f"Downloaded video length: {int(dur)}s")
@@ -569,8 +596,8 @@ async def show_id(event):
 @client.on(events.NewMessage(incoming=True, pattern=r"^/(start|help)"))
 async def start(event):
     spawn(notify_owner(event, "started the bot"))
-    await event.reply("Send me an Instagram, TikTok or YouTube link and I'll send the video back. "
-                      "For long YouTube videos you can pick the quality.")
+    await event.reply("Send me a link to a video (Instagram, TikTok, YouTube and many other sites) "
+                      "and I'll send it back. YouTube links let you pick the quality.")
 
 
 @client.on(events.NewMessage(incoming=True))
@@ -583,18 +610,13 @@ async def handle_messages(event):
         return
     url = match.group(0)
     low = url.lower()
-    adult = is_adult_url(url)
-    if not adult and not any(p in low for p in PLATFORMS):
+    known = any(p in low for p in PLATFORMS)
+    if not known and not (event.is_private or ANY_LINK_IN_GROUPS):
+        return          # random links in groups are not for us
+    if not await asyncio.to_thread(url_is_safe, url):
+        if event.is_private:
+            await event.reply("That doesn't look like a public video link.")
         return
-
-    if adult:
-        approved = (ADULT_OPEN or bool(OWNER_ID and event.sender_id == OWNER_ID)
-                    or event.sender_id in ADULT_ALLOWED_IDS)
-        if not approved or not (event.is_private or ADULT_ALLOW_GROUPS):
-            host = urlparse(url).hostname
-            spawn(notify_owner(event, f"tried a restricted site (blocked): {host}"))
-            await event.reply("That site isn't enabled for you here.")
-            return
 
     spawn(notify_owner(event, f"sent a link:\n{url}"))
 
@@ -657,7 +679,7 @@ async def main():
     DL_SEM = asyncio.Semaphore(MAX_PARALLEL)
     await client.start(bot_token=BOT_TOKEN)
     print(f"Bot is online. yt-dlp {yt_dlp.version.__version__}, cookies: {bool(COOKIE_FILE)}, "
-          f"ffmpeg: {bool(FFMPEG)}, limit: {MAX_MB} MB, max height: {MAX_HEIGHT}p, "
+          f"ffmpeg: {FFMPEG}, limit: {MAX_MB} MB, max height: {MAX_HEIGHT}p, "
           f"compress videos of {COMPRESS_MIN_MINUTES}+ min, buttons for videos over: {LONG_SECONDS}s, "
           f"owner alerts: {bool(OWNER_ID)}")
     await client.run_until_disconnected()
