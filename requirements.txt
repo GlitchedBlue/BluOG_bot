@@ -1,4 +1,6 @@
-pyTelegramBotAPI
+telethon
 requests
 yt-dlp[default]
 deno
+imageio-ffmpeg
+hachoir
