@@ -1,13 +1,25 @@
 import os
 import re
+import sys
 import json
 import shutil
 import asyncio
 import tempfile
+import subprocess
 
 import requests
-import yt_dlp
 from telebot.async_telebot import AsyncTeleBot
+
+# YouTube changes constantly, so grab the newest yt-dlp every time the bot starts.
+try:
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-U", "--quiet", "yt-dlp[default]"],
+        timeout=180, check=False,
+    )
+except Exception as _e:
+    print(f"yt-dlp upgrade skipped: {_e}")
+
+import yt_dlp  # noqa: E402  (imported after the upgrade on purpose)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 bot = AsyncTeleBot(BOT_TOKEN)
@@ -22,7 +34,6 @@ PLATFORMS = (
     "instagram.com", "tiktok.com", "youtube.com", "youtu.be", "facebook.com", "fb.watch",
 )
 
-# Write cookies to a file once at startup so yt-dlp can use them
 COOKIE_FILE = None
 if YT_COOKIES:
     COOKIE_FILE = "/tmp/cookies.txt"
@@ -30,8 +41,7 @@ if YT_COOKIES:
         f.write(YT_COOKIES)
 
 
-def ytdlp_download(url: str, outdir: str) -> str:
-    """Blocking download with yt-dlp. Returns the file path. Raises on failure."""
+def base_opts(outdir: str) -> dict:
     opts = {
         # Single-file formats only (no ffmpeg needed), small enough for Telegram
         "format": "best[ext=mp4][filesize<48M]/best[ext=mp4][filesize_approx<48M]/best[height<=480][ext=mp4]/best[ext=mp4]/best",
@@ -43,19 +53,64 @@ def ytdlp_download(url: str, outdir: str) -> str:
         "max_filesize": MAX_BYTES,
         "retries": 2,
     }
-    if COOKIE_FILE:
-        opts["cookiefile"] = COOKIE_FILE
     if PROXY:
         opts["proxy"] = PROXY
+    return opts
+
+
+def youtube_attempts(outdir: str):
+    """Different ways of asking YouTube, tried in order until one works."""
+    attempts = []
+    if COOKIE_FILE:
+        o = base_opts(outdir); o["cookiefile"] = COOKIE_FILE
+        attempts.append(("cookies+default", o))
+        for client in ("mweb", "web_safari", "tv"):
+            o = base_opts(outdir); o["cookiefile"] = COOKIE_FILE
+            o["extractor_args"] = {"youtube": {"player_client": [client]}}
+            attempts.append((f"cookies+{client}", o))
+    # No-cookie fallbacks (these clients don't use account cookies)
+    for client in ("android_vr", "tv_simply", "ios"):
+        o = base_opts(outdir)
+        o["extractor_args"] = {"youtube": {"player_client": [client]}}
+        attempts.append((f"nocookies+{client}", o))
+    return attempts
+
+
+def run_ytdlp(opts: dict, url: str, outdir: str) -> str:
+    # start from a clean folder so a half-finished attempt can't confuse us
+    for name in os.listdir(outdir):
+        try:
+            os.remove(os.path.join(outdir, name))
+        except OSError:
+            pass
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
         path = ydl.prepare_filename(info)
-    if not os.path.exists(path):
-        # extension can differ after post-processing
-        for name in os.listdir(outdir):
+    if os.path.exists(path):
+        return path
+    for name in os.listdir(outdir):
+        if not name.endswith((".part", ".ytdl")):
             return os.path.join(outdir, name)
-        raise FileNotFoundError("yt-dlp produced no file")
-    return path
+    raise FileNotFoundError("yt-dlp produced no file")
+
+
+def ytdlp_download(url: str, outdir: str) -> str:
+    low = url.lower()
+    if "youtube.com" in low or "youtu.be" in low:
+        attempts = youtube_attempts(outdir)
+    else:
+        attempts = [("default", base_opts(outdir))]
+        if COOKIE_FILE is None:
+            pass
+    errors = []
+    for label, opts in attempts:
+        try:
+            print(f"yt-dlp attempt: {label}")
+            return run_ytdlp(opts, url, outdir)
+        except Exception as e:
+            print(f"yt-dlp attempt '{label}' failed: {e}")
+            errors.append(f"[{label}] {e}")
+    raise RuntimeError(" | ".join(errors))
 
 
 def instagram_embed_download(url: str, outdir: str) -> str:
@@ -126,8 +181,10 @@ async def handle_messages(message):
         except Exception as e:
             print(f"Download failed for {url}: {e}")
             msg = str(e).lower()
-            if "sign in" in msg or "bot" in msg or "cookies" in msg:
-                text = "YouTube is asking for login from this server. The bot owner needs to add cookies."
+            if "sign in" in msg or "confirm you" in msg:
+                text = "YouTube wants a login from this server. The bot owner needs to refresh the cookies."
+            elif "needs to be reloaded" in msg:
+                text = "YouTube rejected the request from this server. Try again in a bit."
             elif "larger than" in msg or "too large" in msg or "max-filesize" in msg:
                 text = "That video is over Telegram's 50 MB bot limit."
             else:
@@ -161,7 +218,7 @@ async def main():
         await bot.delete_webhook(drop_pending_updates=True)
     except Exception:
         pass
-    print("Bot is online.")
+    print(f"Bot is online. yt-dlp {yt_dlp.version.__version__}, cookies: {bool(COOKIE_FILE)}")
     await bot.polling(non_stop=True, timeout=90)
 
 
