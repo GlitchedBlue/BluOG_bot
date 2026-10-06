@@ -452,6 +452,9 @@ def instagram_photo_album_download(url: str, outdir: str) -> list[str]:
     res = requests.get(embed, headers=headers, timeout=15, proxies=proxies)
     res.raise_for_status()
     page = res.text
+
+    if any(x in page.lower() for x in ("please wait a few minutes", "challenge", "require_login", "checkpoint", "not a video")):
+        raise ValueError("Instagram blocked this post from public access")
     if re.search(r'"video_url":"[^"]+"', page):
         raise ValueError("video post, not a photo album")
 
@@ -596,6 +599,8 @@ def friendly_error(e: Exception) -> str:
         return "YouTube wants a login from this server. The bot owner needs to refresh the cookies."
     if "needs to be reloaded" in msg:
         return "YouTube rejected the request from this server. Try again in a bit."
+    if "instagram blocked this post from public access" in msg or "no valid image files found" in msg or "no images found in this post" in msg:
+        return "Instagram is blocking that post from public access, so I can't fetch it without a login."
     return "Couldn't get a video from that link. It may be private, unsupported, or blocked."
 
 
@@ -639,6 +644,8 @@ async def process_and_send(chat_id, reply_to, url, height=None, status=None):
                             return
                         except Exception as e:
                             print(f"Instagram photo album detection failed for {url}: {e}")
+                            await say(status, friendly_error(e))
+                            return
                     await say(status, "Downloading...")
                     path = await asyncio.to_thread(fetch_video, url, tmp, height)
                     if height != "audio":
