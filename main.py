@@ -378,6 +378,52 @@ def instagram_embed_download(url: str, outdir: str) -> str:
     return path
 
 
+def instagram_photo_album_download(url: str, outdir: str) -> list[str]:
+    """Return a list of direct image URLs for an Instagram single/album post."""
+    m = re.search(r"instagram\.com/(?:[\w.]+/)?(?:reel|reels|p|tv)/([\w-]+)", url)
+    if not m:
+        raise ValueError("not an instagram post url")
+    embed = f"https://www.instagram.com/p/{m.group(1)}/embed/captioned/"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                             "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
+    proxies = {"http": PROXY, "https": PROXY} if PROXY else None
+    res = requests.get(embed, headers=headers, timeout=15, proxies=proxies)
+    res.raise_for_status()
+    if re.search(r'"video_url":"[^"]+"', res.text):
+        raise ValueError("video post, not a photo album")
+
+    candidates = []
+    for pattern in (r'"display_url":"([^"]+)"', r'"thumbnail_src":"([^"]+)"', r'"image_url":"([^"]+)"'):
+        for raw in re.findall(pattern, res.text):
+            try:
+                decoded = json.loads('"' + raw + '"')
+            except Exception:
+                decoded = raw
+            if decoded.startswith("http"):
+                candidates.append(decoded)
+
+    seen = set()
+    files = []
+    for idx, image_url in enumerate(candidates):
+        if image_url in seen:
+            continue
+        seen.add(image_url)
+        path = os.path.join(outdir, f"photo_{idx}.jpg")
+        with requests.get(image_url, headers=headers, stream=True, timeout=20, proxies=proxies) as r:
+            r.raise_for_status()
+            size = 0
+            with open(path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=65536):
+                    size += len(chunk)
+                    if size > MAX_BYTES:
+                        raise ValueError("photo too large")
+                    f.write(chunk)
+        files.append(path)
+    if not files:
+        raise ValueError("no images found in this post")
+    return files
+
+
 def fetch_video(url: str, outdir: str, height=None) -> str:
     low = url.lower()
     errors = []
@@ -511,6 +557,21 @@ async def process_and_send(chat_id, reply_to, url, height=None, status=None):
         async with DL_SEM:
             async with client.action(chat_id, "audio" if height == "audio" else "video"):
                 try:
+                    low = url.lower()
+                    if "instagram.com" in low:
+                        try:
+                            await say(status, "Checking photo post...")
+                            photos = await asyncio.to_thread(instagram_photo_album_download, url, tmp)
+                            await say(status, "Sending photo album...")
+                            await client.send_file(chat_id, photos, reply_to=reply_to)
+                            if status is not None:
+                                try:
+                                    await status.delete()
+                                except Exception:
+                                    pass
+                            return
+                        except Exception as e:
+                            print(f"Instagram photo album detection failed for {url}: {e}")
                     await say(status, "Downloading...")
                     path = await asyncio.to_thread(fetch_video, url, tmp, height)
                     if height != "audio":
@@ -520,7 +581,10 @@ async def process_and_send(chat_id, reply_to, url, height=None, status=None):
                     if height is None and FFMPEG:
                         dur = await asyncio.to_thread(video_duration, path)
                         print(f"Downloaded video length: {int(dur)}s")
-                        if dur >= COMPRESS_MIN_MINUTES * 60:
+                        should_compress = dur >= COMPRESS_MIN_MINUTES * 60
+                        if "instagram.com" in low or "tiktok.com" in low or "facebook.com" in low or "fb.watch" in low:
+                            should_compress = should_compress and (dur >= COMPRESS_MIN_MINUTES * 60)
+                        if should_compress:
                             mb = os.path.getsize(path) // (1024 * 1024)
                             await say(status, f"Compressing ({mb} MB)... this is the slow part.")
                             path = await asyncio.to_thread(maybe_compress, path)
@@ -623,10 +687,10 @@ async def handle_messages(event):
     # Instant feedback: this one message is updated all the way through, then deleted
     status = await event.reply("Preparing your video...")
 
-    # Long YouTube videos: let the user pick the quality first
+    # YouTube: always let the user pick the quality first, unless it's a live stream.
     if "youtube.com" in low or "youtu.be" in low:
         info = await asyncio.to_thread(get_youtube_info, url)
-        if info and (info.get("duration") or 0) > LONG_SECONDS and not info.get("is_live"):
+        if info and not info.get("is_live"):
             options = quality_options(info)
             if options:
                 prune_pending()
