@@ -465,17 +465,26 @@ def instagram_photo_album_download(url: str, outdir: str) -> list[str]:
         if image_url in seen:
             continue
         seen.add(image_url)
-        path = os.path.join(outdir, f"photo_{idx}.jpg")
         with requests.get(image_url, headers=headers, stream=True, timeout=20, proxies=proxies) as r:
             r.raise_for_status()
+            ctype = (r.headers.get("Content-Type") or "image/jpeg").split(";")[0].strip().lower()
+            if not ctype.startswith("image/"):
+                continue
+            ext_map = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp", "image/gif": ".gif"}
+            ext = ext_map.get(ctype, ".jpg")
+            path = os.path.join(outdir, f"photo_{idx}{ext}")
             size = 0
             with open(path, "wb") as f:
                 for chunk in r.iter_content(chunk_size=65536):
+                    if not chunk:
+                        continue
                     size += len(chunk)
                     if size > MAX_BYTES:
                         raise ValueError("photo too large")
                     f.write(chunk)
         files.append(path)
+    if not files:
+        raise ValueError("no valid image files found in this post")
     return files
 
 
@@ -618,7 +627,10 @@ async def process_and_send(chat_id, reply_to, url, height=None, status=None):
                             await say(status, "Checking photo post...")
                             photos = await asyncio.to_thread(instagram_photo_album_download, url, tmp)
                             await say(status, "Sending photo album...")
-                            await client.send_file(chat_id, photos, reply_to=reply_to)
+                            if len(photos) == 1:
+                                await client.send_file(chat_id, photos[0], reply_to=reply_to)
+                            else:
+                                await client.send_file(chat_id, photos, reply_to=reply_to)
                             if status is not None:
                                 try:
                                     await status.delete()
