@@ -262,10 +262,25 @@ def get_youtube_info(url: str):
             with yt_dlp.YoutubeDL(opts) as ydl:
                 # process=False skips format selection, so this can't fail on format choice
                 info = ydl.extract_info(url, download=False, process=False)
-            if info and info.get("duration") is not None:
-                return info
+            if isinstance(info, dict):
+                if info.get("duration") is not None:
+                    return info
+                entries = info.get("entries") or []
+                if isinstance(entries, list) and entries and isinstance(entries[0], dict):
+                    first = entries[0]
+                    if first.get("duration") is not None:
+                        return first
         except Exception as e:
             print(f"info attempt '{label}' failed: {e}")
+
+    # last-resort fallback: let yt-dlp do the full metadata extraction
+    try:
+        with yt_dlp.YoutubeDL({"quiet": True, "noplaylist": True, "skip_download": True}) as ydl:
+            info = ydl.extract_info(url, download=False)
+        if isinstance(info, dict) and info.get("duration") is not None:
+            return info
+    except Exception as e:
+        print(f"youtube info fallback failed: {e}")
     return None
 
 
@@ -361,10 +376,15 @@ def instagram_embed_download(url: str, outdir: str) -> str:
     proxies = {"http": PROXY, "https": PROXY} if PROXY else None
     res = requests.get(embed, headers=headers, timeout=12, proxies=proxies)
     res.raise_for_status()
-    vm = re.search(r'"video_url":"([^"]+)"', res.text)
-    if not vm:
-        raise ValueError("no video_url in embed page")
-    direct = json.loads('"' + vm.group(1) + '"')
+    page = res.text
+    candidates = _instagram_candidates(page)
+    direct = next((c for c in candidates if ".mp4" in c.lower() or "/video/" in c.lower()), None)
+    if not direct:
+        # Fallback for older embed pages
+        vm = re.search(r'"video_url":"([^"]+)"', page)
+        if not vm:
+            raise ValueError("no video_url in embed page")
+        direct = json.loads('"' + vm.group(1) + '"')
     path = os.path.join(outdir, "video.mp4")
     with requests.get(direct, headers=headers, stream=True, timeout=20, proxies=proxies) as r:
         r.raise_for_status()
@@ -378,6 +398,48 @@ def instagram_embed_download(url: str, outdir: str) -> str:
     return path
 
 
+def _instagram_candidates(page: str):
+    """Extract media URLs from Instagram's modern embed JSON/HTML."""
+    candidates = []
+    pattern_names = (
+        'video_url', 'display_url', 'thumbnail_src', 'image_url', 'src', 'media_url'
+    )
+    for name in pattern_names:
+        for raw in re.findall(rf'"{name}":"([^"]+)"', page):
+            try:
+                decoded = json.loads('"' + raw + '"')
+            except Exception:
+                decoded = raw
+            if decoded.startswith("http"):
+                candidates.append(decoded)
+
+    for raw in re.findall(r'"display_resources":\[(.*?)\]', page, flags=re.S):
+        for src in re.findall(r'"src":"([^"]+)"', raw):
+            try:
+                decoded = json.loads('"' + src + '"')
+            except Exception:
+                decoded = src
+            if decoded.startswith("http"):
+                candidates.append(decoded)
+
+    for raw in re.findall(r'"edge_sidecar_to_children".*?"edges":\[(.*?)\]', page, flags=re.S):
+        for src in re.findall(r'"display_url":"([^"]+)"', raw):
+            try:
+                decoded = json.loads('"' + src + '"')
+            except Exception:
+                decoded = src
+            if decoded.startswith("http"):
+                candidates.append(decoded)
+
+    seen = []
+    result = []
+    for url in candidates:
+        if url not in seen:
+            seen.append(url)
+            result.append(url)
+    return result
+
+
 def instagram_photo_album_download(url: str, outdir: str) -> list[str]:
     """Return a list of direct image URLs for an Instagram single/album post."""
     m = re.search(r"instagram\.com/(?:[\w.]+/)?(?:reel|reels|p|tv)/([\w-]+)", url)
@@ -389,18 +451,13 @@ def instagram_photo_album_download(url: str, outdir: str) -> list[str]:
     proxies = {"http": PROXY, "https": PROXY} if PROXY else None
     res = requests.get(embed, headers=headers, timeout=15, proxies=proxies)
     res.raise_for_status()
-    if re.search(r'"video_url":"[^"]+"', res.text):
+    page = res.text
+    if re.search(r'"video_url":"[^"]+"', page):
         raise ValueError("video post, not a photo album")
 
-    candidates = []
-    for pattern in (r'"display_url":"([^"]+)"', r'"thumbnail_src":"([^"]+)"', r'"image_url":"([^"]+)"'):
-        for raw in re.findall(pattern, res.text):
-            try:
-                decoded = json.loads('"' + raw + '"')
-            except Exception:
-                decoded = raw
-            if decoded.startswith("http"):
-                candidates.append(decoded)
+    candidates = _instagram_candidates(page)
+    if not candidates:
+        raise ValueError("no images found in this post")
 
     seen = set()
     files = []
@@ -419,8 +476,6 @@ def instagram_photo_album_download(url: str, outdir: str) -> list[str]:
                         raise ValueError("photo too large")
                     f.write(chunk)
         files.append(path)
-    if not files:
-        raise ValueError("no images found in this post")
     return files
 
 
