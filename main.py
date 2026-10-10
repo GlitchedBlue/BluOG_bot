@@ -43,6 +43,7 @@ LONG_SECONDS = int(os.getenv("LONG_SECONDS", "0"))           # YouTube videos lo
 MAX_PARALLEL = int(os.getenv("MAX_PARALLEL", "2"))             # downloads at the same time
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))                     # your Telegram user ID: the bot DMs you who uses it
 CHAT_STORE = os.getenv("CHAT_STORE", "bot_chats.json")
+GROUP_CHAT_STORE = os.getenv("GROUP_CHAT_STORE", CHAT_STORE + ".groups")
 
 # ---- Links ----
 # Private chats: the bot tries any link that points to a video.
@@ -98,6 +99,7 @@ client = TelegramClient(StringSession(), API_ID, API_HASH)
 DL_SEM = None            # created in main() so it belongs to the running event loop
 pending = {}             # quality-button requests waiting for a click
 pending_announcements = {}
+GROUP_CHATS = set()
 
 
 def load_known_chats() -> set[int]:
@@ -112,6 +114,14 @@ def load_known_chats() -> set[int]:
 
 
 KNOWN_CHATS = load_known_chats()
+try:
+    with open(GROUP_CHAT_STORE) as f:
+        GROUP_CHATS = {int(chat_id) for chat_id in json.load(f)}
+except FileNotFoundError:
+    GROUP_CHATS = set()
+except Exception as e:
+    print(f"Could not load registered groups: {e}")
+    GROUP_CHATS = set()
 
 
 def remember_chat(chat_id: int):
@@ -125,6 +135,39 @@ def remember_chat(chat_id: int):
     except Exception as e:
         KNOWN_CHATS.discard(chat_id)
         print(f"Could not save known chats: {e}")
+
+
+def remember_group_chat(chat_id: int):
+    remember_chat(chat_id)
+    if chat_id in GROUP_CHATS:
+        return
+    GROUP_CHATS.add(chat_id)
+    try:
+        with open(GROUP_CHAT_STORE + ".tmp", "w") as f:
+            json.dump(sorted(GROUP_CHATS), f)
+        os.replace(GROUP_CHAT_STORE + ".tmp", GROUP_CHAT_STORE)
+    except Exception as e:
+        GROUP_CHATS.discard(chat_id)
+        print(f"Could not save registered groups: {e}")
+
+
+def forget_chat(chat_id: int):
+    if chat_id not in KNOWN_CHATS:
+        return False
+    KNOWN_CHATS.discard(chat_id)
+    GROUP_CHATS.discard(chat_id)
+    try:
+        with open(CHAT_STORE + ".tmp", "w") as f:
+            json.dump(sorted(KNOWN_CHATS), f)
+        os.replace(CHAT_STORE + ".tmp", CHAT_STORE)
+        with open(GROUP_CHAT_STORE + ".tmp", "w") as f:
+            json.dump(sorted(GROUP_CHATS), f)
+        os.replace(GROUP_CHAT_STORE + ".tmp", GROUP_CHAT_STORE)
+    except Exception as e:
+        KNOWN_CHATS.add(chat_id)
+        print(f"Could not save known chats: {e}")
+        return False
+    return True
 
 
 # ------------------------------------------------------------------ yt-dlp helpers
@@ -771,8 +814,33 @@ async def show_status(event):
         f"Default video quality cap: {MAX_HEIGHT}p\n"
         f"Parallel downloads: {MAX_PARALLEL}\n"
         f"Known announcement chats: {len(KNOWN_CHATS)}\n"
-        f"Commands: /status, /announce [message]"
+        f"Registered groups: {len(GROUP_CHATS)}\n"
+        f"Commands: /status, /register (in a group), /unregister (in a group), /announce [message]"
     )
+
+
+@client.on(events.NewMessage(incoming=True, pattern=r"^/register(?:@\w+)?$"))
+async def register_group(event):
+    if not OWNER_ID or event.sender_id != OWNER_ID:
+        return
+    if not event.is_group:
+        await event.reply("Run /register inside the group you want to receive announcements.")
+        return
+    remember_group_chat(event.chat_id)
+    await event.reply("This group is registered for announcements.")
+
+
+@client.on(events.NewMessage(incoming=True, pattern=r"^/unregister(?:@\w+)?$"))
+async def unregister_group(event):
+    if not OWNER_ID or event.sender_id != OWNER_ID:
+        return
+    if not event.is_group:
+        await event.reply("Run /unregister inside the group you want to remove.")
+        return
+    if forget_chat(event.chat_id):
+        await event.reply("This group will no longer receive announcements.")
+    else:
+        await event.reply("This group was not registered.")
 
 
 @client.on(events.NewMessage(incoming=True, pattern=r"^/announce(?:@\w+)?(?:\s+(.*))?$"))
@@ -792,7 +860,8 @@ async def preview_announcement(event):
     pending_announcements[pid] = {"text": message, "ts": time.time()}
     recipients = len(KNOWN_CHATS)
     await event.reply(
-        f"Preview for {recipients} known chats:\n\n{message}\n\nSend it?",
+        f"Preview for {recipients} known chats ({len(GROUP_CHATS)} registered groups):\n\n"
+        f"{message}\n\nSend it?",
         buttons=[
             Button.inline("Send", data=f"a|{pid}|send".encode()),
             Button.inline("Cancel", data=f"a|{pid}|cancel".encode()),
@@ -839,12 +908,15 @@ async def on_announcement_choice(event):
 
 @client.on(events.NewMessage(incoming=True, pattern=r"^/(start|help)"))
 async def start(event):
-    remember_chat(event.chat_id)
+    if event.is_group:
+        remember_group_chat(event.chat_id)
+    else:
+        remember_chat(event.chat_id)
     spawn(notify_owner(event, "started the bot"))
     message = ("Send me a link to a video (Instagram, TikTok, YouTube and many other sites) "
                "and I'll send it back. YouTube links let you pick the quality.")
     if OWNER_ID and event.sender_id == OWNER_ID and event.is_private:
-        message += "\n\nOwner commands: /status, /announce, /announce <message>"
+        message += "\n\nOwner commands: /status, /register (in a group), /unregister (in a group), /announce, /announce <message>"
     await event.reply(message)
 
 
@@ -866,7 +938,10 @@ async def handle_messages(event):
             await event.reply("That doesn't look like a public video link.")
         return
 
-    remember_chat(event.chat_id)
+    if event.is_group:
+        remember_group_chat(event.chat_id)
+    else:
+        remember_chat(event.chat_id)
     spawn(notify_owner(event, f"sent a link:\n{url}"))
 
     # Instant feedback: this one message is updated all the way through, then deleted
