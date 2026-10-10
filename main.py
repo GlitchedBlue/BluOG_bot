@@ -42,6 +42,7 @@ COMPRESS_PRESET = os.getenv("COMPRESS_PRESET", "veryfast")     # ultrafast = qui
 LONG_SECONDS = int(os.getenv("LONG_SECONDS", "0"))           # YouTube videos longer than this get quality buttons
 MAX_PARALLEL = int(os.getenv("MAX_PARALLEL", "2"))             # downloads at the same time
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))                     # your Telegram user ID: the bot DMs you who uses it
+CHAT_STORE = os.getenv("CHAT_STORE", "bot_chats.json")
 
 # ---- Links ----
 # Private chats: the bot tries any link that points to a video.
@@ -96,6 +97,34 @@ if YT_COOKIES:
 client = TelegramClient(StringSession(), API_ID, API_HASH)
 DL_SEM = None            # created in main() so it belongs to the running event loop
 pending = {}             # quality-button requests waiting for a click
+pending_announcements = {}
+
+
+def load_known_chats() -> set[int]:
+    try:
+        with open(CHAT_STORE) as f:
+            return {int(chat_id) for chat_id in json.load(f)}
+    except FileNotFoundError:
+        return set()
+    except Exception as e:
+        print(f"Could not load known chats: {e}")
+        return set()
+
+
+KNOWN_CHATS = load_known_chats()
+
+
+def remember_chat(chat_id: int):
+    if chat_id in KNOWN_CHATS:
+        return
+    KNOWN_CHATS.add(chat_id)
+    try:
+        with open(CHAT_STORE + ".tmp", "w") as f:
+            json.dump(sorted(KNOWN_CHATS), f)
+        os.replace(CHAT_STORE + ".tmp", CHAT_STORE)
+    except Exception as e:
+        KNOWN_CHATS.discard(chat_id)
+        print(f"Could not save known chats: {e}")
 
 
 # ------------------------------------------------------------------ yt-dlp helpers
@@ -732,11 +761,91 @@ async def show_id(event):
     await event.reply(f"Your Telegram ID: {event.sender_id}")
 
 
+@client.on(events.NewMessage(incoming=True, pattern=r"^/status(?:@\w+)?$"))
+async def show_status(event):
+    if not OWNER_ID or event.sender_id != OWNER_ID or not event.is_private:
+        return
+    await event.reply(
+        f"Bot is online.\n"
+        f"Max upload: {MAX_MB} MB\n"
+        f"Default video quality cap: {MAX_HEIGHT}p\n"
+        f"Parallel downloads: {MAX_PARALLEL}\n"
+        f"Known announcement chats: {len(KNOWN_CHATS)}\n"
+        f"Commands: /status, /announce [message]"
+    )
+
+
+@client.on(events.NewMessage(incoming=True, pattern=r"^/announce(?:@\w+)?(?:\s+(.*))?$"))
+async def preview_announcement(event):
+    if not OWNER_ID or event.sender_id != OWNER_ID or not event.is_private:
+        return
+    message = (event.pattern_match.group(1) or "").strip()
+    if not message:
+        message = (
+            "Recent fixes: YouTube links now offer quality choices, Instagram Reels "
+            "download as videos, and photo-post handling has been improved."
+        )
+    if len(message) > 4000:
+        await event.reply("Announcement is too long (maximum 4000 characters).")
+        return
+    pid = uuid.uuid4().hex[:8]
+    pending_announcements[pid] = {"text": message, "ts": time.time()}
+    recipients = len(KNOWN_CHATS)
+    await event.reply(
+        f"Preview for {recipients} known chats:\n\n{message}\n\nSend it?",
+        buttons=[
+            Button.inline("Send", data=f"a|{pid}|send".encode()),
+            Button.inline("Cancel", data=f"a|{pid}|cancel".encode()),
+        ],
+    )
+
+
+@client.on(events.CallbackQuery(pattern=rb"^a\|"))
+async def on_announcement_choice(event):
+    if not OWNER_ID or event.sender_id != OWNER_ID:
+        await event.answer("Only the bot owner can do that.", alert=True)
+        return
+    try:
+        _, pid, choice = event.data.decode().split("|", 2)
+    except Exception:
+        return
+    announcement = pending_announcements.get(pid)
+    if not announcement or time.time() - announcement["ts"] > 600:
+        pending_announcements.pop(pid, None)
+        await event.answer("This preview expired. Run /announce again.", alert=True)
+        return
+    pending_announcements.pop(pid, None)
+    if choice == "cancel":
+        await event.answer("Canceled")
+        await event.edit("Announcement canceled.")
+        return
+    if choice != "send":
+        await event.answer("Unknown action.", alert=True)
+        return
+
+    await event.answer("Sending...")
+    await event.edit(f"Sending announcement to {len(KNOWN_CHATS)} chats...")
+    sent = failed = 0
+    for chat_id in sorted(KNOWN_CHATS):
+        try:
+            await client.send_message(chat_id, announcement["text"], link_preview=False)
+            sent += 1
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            failed += 1
+            print(f"Announcement failed for chat {chat_id}: {e}")
+    await event.edit(f"Announcement complete. Sent: {sent}; failed: {failed}.")
+
+
 @client.on(events.NewMessage(incoming=True, pattern=r"^/(start|help)"))
 async def start(event):
+    remember_chat(event.chat_id)
     spawn(notify_owner(event, "started the bot"))
-    await event.reply("Send me a link to a video (Instagram, TikTok, YouTube and many other sites) "
-                      "and I'll send it back. YouTube links let you pick the quality.")
+    message = ("Send me a link to a video (Instagram, TikTok, YouTube and many other sites) "
+               "and I'll send it back. YouTube links let you pick the quality.")
+    if OWNER_ID and event.sender_id == OWNER_ID and event.is_private:
+        message += "\n\nOwner commands: /status, /announce, /announce <message>"
+    await event.reply(message)
 
 
 @client.on(events.NewMessage(incoming=True))
@@ -757,6 +866,7 @@ async def handle_messages(event):
             await event.reply("That doesn't look like a public video link.")
         return
 
+    remember_chat(event.chat_id)
     spawn(notify_owner(event, f"sent a link:\n{url}"))
 
     # Instant feedback: this one message is updated all the way through, then deleted
