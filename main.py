@@ -629,25 +629,26 @@ async def process_and_send(chat_id, reply_to, url, height=None, status=None):
                     low = url.lower()
                     if "instagram.com" in low:
                         try:
-                            await say(status, "Checking photo post...")
+                            await say(status, "Downloading Instagram video...")
+                            path = await asyncio.to_thread(fetch_video, url, tmp, height)
+                        except Exception as video_error:
+                            print(f"Instagram video download failed for {url}: {video_error}")
+                            await say(status, "Checking for Instagram photos...")
                             photos = await asyncio.to_thread(instagram_photo_album_download, url, tmp)
                             await say(status, "Sending photo album...")
-                            if len(photos) == 1:
-                                await client.send_file(chat_id, photos[0], reply_to=reply_to)
-                            else:
-                                await client.send_file(chat_id, photos, reply_to=reply_to)
+                            await client.send_file(
+                                chat_id, photos[0] if len(photos) == 1 else photos,
+                                reply_to=reply_to,
+                            )
                             if status is not None:
                                 try:
                                     await status.delete()
                                 except Exception:
                                     pass
                             return
-                        except Exception as e:
-                            print(f"Instagram photo album detection failed for {url}: {e}")
-                            await say(status, friendly_error(e))
-                            return
-                    await say(status, "Downloading...")
-                    path = await asyncio.to_thread(fetch_video, url, tmp, height)
+                    else:
+                        await say(status, "Downloading...")
+                        path = await asyncio.to_thread(fetch_video, url, tmp, height)
                     if height != "audio":
                         path = await asyncio.to_thread(ensure_mp4, path)
                     if not path.lower().endswith(MEDIA_EXTS):
