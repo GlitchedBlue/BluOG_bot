@@ -124,6 +124,10 @@ except Exception as e:
     GROUP_CHATS = set()
 
 
+def is_group_chat(chat_id: int) -> bool:
+    return chat_id < 0 or chat_id in GROUP_CHATS
+
+
 def remember_chat(chat_id: int):
     if chat_id in KNOWN_CHATS:
         return
@@ -858,9 +862,10 @@ async def preview_announcement(event):
         return
     pid = uuid.uuid4().hex[:8]
     pending_announcements[pid] = {"text": message, "ts": time.time()}
-    recipients = len(KNOWN_CHATS)
+    group_count = sum(is_group_chat(chat_id) for chat_id in KNOWN_CHATS)
+    user_count = len(KNOWN_CHATS) - group_count
     await event.reply(
-        f"Preview for {recipients} known chats ({len(GROUP_CHATS)} registered groups):\n\n"
+        f"Preview for {user_count} users/private chats and {group_count} groups/channels:\n\n"
         f"{message}\n\nSend it?",
         buttons=[
             Button.inline("Send", data=f"a|{pid}|send".encode()),
@@ -893,17 +898,31 @@ async def on_announcement_choice(event):
         return
 
     await event.answer("Sending...")
-    await event.edit(f"Sending announcement to {len(KNOWN_CHATS)} chats...")
-    sent = failed = 0
+    group_count = sum(is_group_chat(chat_id) for chat_id in KNOWN_CHATS)
+    user_count = len(KNOWN_CHATS) - group_count
+    await event.edit(
+        f"Sending to {user_count} users/private chats and {group_count} groups/channels..."
+    )
+    counts = {
+        "user_sent": 0, "user_failed": 0,
+        "group_sent": 0, "group_failed": 0,
+    }
     for chat_id in sorted(KNOWN_CHATS):
+        kind = "group" if is_group_chat(chat_id) else "user"
         try:
             await client.send_message(chat_id, announcement["text"], link_preview=False)
-            sent += 1
+            counts[f"{kind}_sent"] += 1
             await asyncio.sleep(0.05)
         except Exception as e:
-            failed += 1
+            counts[f"{kind}_failed"] += 1
             print(f"Announcement failed for chat {chat_id}: {e}")
-    await event.edit(f"Announcement complete. Sent: {sent}; failed: {failed}.")
+    await event.edit(
+        "Announcement complete.\n"
+        f"Users/private chats: {counts['user_sent']} sent, {counts['user_failed']} failed.\n"
+        f"Groups/channels: {counts['group_sent']} sent, {counts['group_failed']} failed.\n"
+        f"Total: {counts['user_sent'] + counts['group_sent']} sent, "
+        f"{counts['user_failed'] + counts['group_failed']} failed."
+    )
 
 
 @client.on(events.NewMessage(incoming=True, pattern=r"^/(start|help)"))
